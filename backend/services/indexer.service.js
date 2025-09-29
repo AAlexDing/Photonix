@@ -546,7 +546,7 @@ function watchPhotosDir() {
                     await fs.rm(thumbsSubtree, { recursive: true, force: true }).catch(() => {});
                     logger.debug(`[Watcher] 目录移除，已递归清理缩略图子树: ${thumbsSubtree}`);
                     // 数据库同步清理该子树的 thumb_status 记录（失败忽略）
-                    try { await dbRun('main', `DELETE FROM thumb_status WHERE path LIKE ? || '/%'`, [relDir]); } catch {} // 忽略删除失败
+                    try { await dbRun('main', `DELETE FROM thumb_status WHERE path LIKE CONCAT(?, '/%')`, [relDir]); } catch {} // 忽略删除失败
                 }
             } catch (e) {
                 logger.warn('[Watcher] 清理目录缩略图子树失败（忽略）：', e && e.message);
@@ -562,7 +562,7 @@ function watchPhotosDir() {
         // 仅跟踪媒体文件或目录；非媒体文件（含 .db/.wal/.shm）直接忽略
         if (type === 'add') {
             const isMedia = /\.(jpe?g|png|webp|gif|mp4|webm|mov)$/i.test(filePath);
-            const isDbLike = /\.(db|db3|sqlite|sqlite3|wal|shm)$/i.test(filePath) || /history\.db(-wal|-shm)?$/i.test(filePath);
+            const isDbLike = /\.(db|db3|sql|bak|log|tmp)$/i.test(filePath) || /history\.db(-wal|-shm)?$/i.test(filePath);
             if (!isMedia || isDbLike) {
                 return;
             }
@@ -645,11 +645,11 @@ async function recomputeAndPersistAlbumCovers() {
         // 统一使用通用批处理助手执行 UPSERT
         const upsertSql = `INSERT INTO album_covers (album_path, cover_path, width, height, mtime)
                            VALUES (?, ?, ?, ?, ?)
-                           ON CONFLICT(album_path) DO UPDATE SET
-                               cover_path=excluded.cover_path,
-                               width=excluded.width,
-                               height=excluded.height,
-                               mtime=excluded.mtime`;
+                           ON DUPLICATE KEY UPDATE
+                               cover_path=VALUES(cover_path),
+                               width=VALUES(width),
+                               height=VALUES(height),
+                               mtime=VALUES(mtime)`;
         const rows = upserts.map(r => [r.albumPath, r.coverPath, r.width, r.height, r.mtime]);
         await runPreparedBatch('main', upsertSql, rows, { chunkSize: 800 });
         // 完成后无需立即清Redis，这在触发路径已有 invalidateCoverCache；这里仅保障表数据新鲜

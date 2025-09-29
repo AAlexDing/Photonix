@@ -120,11 +120,11 @@ let browseIndexesEnsured = false;
 async function ensureBrowseIndexes() {
     if (browseIndexesEnsured) return;
     try {
-        await runAsync('main', `CREATE INDEX IF NOT EXISTS idx_items_path ON items(path)`)
+        await runAsync('main', `CREATE INDEX IF NOT EXISTS idx_items_path ON items(path(255))`)
         await runAsync('main', `CREATE INDEX IF NOT EXISTS idx_items_type ON items(type)`)
-        await runAsync('main', `CREATE INDEX IF NOT EXISTS idx_items_type_path ON items(type, path)`)
-        await runAsync('main', `CREATE INDEX IF NOT EXISTS idx_items_path_mtime ON items(path, mtime DESC)`)
-        await runAsync('main', `CREATE INDEX IF NOT EXISTS idx_items_type_path_mtime ON items(type, path, mtime DESC)`)
+        await runAsync('main', `CREATE INDEX IF NOT EXISTS idx_items_type_path ON items(type, path(255))`)
+        await runAsync('main', `CREATE INDEX IF NOT EXISTS idx_items_path_mtime ON items(path(255), mtime DESC)`)
+        await runAsync('main', `CREATE INDEX IF NOT EXISTS idx_items_type_path_mtime ON items(type, path(255), mtime DESC)`)
         browseIndexesEnsured = true;
     } catch (e) {
         logger.warn('创建浏览相关索引失败（忽略，不影响功能）:', e && e.message);
@@ -267,8 +267,8 @@ async function getDirectChildrenFromDb(relativePathPrefix, userId, sort, limit, 
     const prefix = (relativePathPrefix || '').replace(/\\/g, '/');
 
     const whereClause = !prefix
-        ? `instr(path, '/') = 0`
-        : `path LIKE ? || '/%' AND instr(substr(path, length(?) + 2), '/') = 0`;
+        ? `LOCATE('/', path) = 0`
+        : `path LIKE CONCAT(?, '/%') AND LOCATE('/', SUBSTRING(path, LENGTH(?) + 2)) = 0`;
     const whereParams = !prefix ? [] : [prefix, prefix];
 
     // 总数（albums + media）
@@ -286,10 +286,10 @@ async function getDirectChildrenFromDb(relativePathPrefix, userId, sort, limit, 
 
     switch (sort) {
         case 'name_asc':
-            orderBy = `ORDER BY is_dir DESC, name COLLATE NOCASE ASC`;
+            orderBy = `ORDER BY is_dir DESC, name ASC`;
             break;
         case 'name_desc':
-            orderBy = `ORDER BY is_dir DESC, name COLLATE NOCASE DESC`;
+            orderBy = `ORDER BY is_dir DESC, name DESC`;
             break;
         case 'mtime_asc':
             orderBy = `ORDER BY is_dir DESC, mtime ASC`;
@@ -299,18 +299,18 @@ async function getDirectChildrenFromDb(relativePathPrefix, userId, sort, limit, 
             break;
         case 'viewed_desc':
             // 不跨库 JOIN，先按名称排序，稍后在页面内做二次排序
-            orderBy = `ORDER BY is_dir DESC, name COLLATE NOCASE ASC`;
+            orderBy = `ORDER BY is_dir DESC, name ASC`;
             break;
         default: // smart
             if (!prefix) {
                 orderBy = `ORDER BY is_dir DESC,
                                    CASE WHEN is_dir=1 THEN CASE WHEN mtime > ${dayAgo} THEN 0 ELSE 1 END END ASC,
                                    CASE WHEN is_dir=1 AND mtime > ${dayAgo} THEN mtime END DESC,
-                                   CASE WHEN is_dir=1 AND mtime <= ${dayAgo} THEN name END COLLATE NOCASE ASC,
-                                   CASE WHEN is_dir=0 THEN name END COLLATE NOCASE ASC`;
+                                   CASE WHEN is_dir=1 AND mtime <= ${dayAgo} THEN name END COLLATE utf8mb4_unicode_ci ASC,
+                                   CASE WHEN is_dir=0 THEN name END COLLATE utf8mb4_unicode_ci ASC`;
             } else {
                 // 子目录 smart：历史优先改为名称排序，稍后在页面内做二次排序
-                orderBy = `ORDER BY is_dir DESC, name COLLATE NOCASE ASC`;
+                orderBy = `ORDER BY is_dir DESC, name ASC`;
             }
     }
 

@@ -1,5 +1,33 @@
 # 服务定义
 services:
+  mariadb:
+    image: mariadb:10.11
+    container_name: Photonix-mariadb
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-photonix123456}
+      MYSQL_USER: ${MARIADB_USER:-photonix}
+      MYSQL_PASSWORD: ${MARIADB_PASSWORD:-photonix123456}
+    volumes:
+#      - /mnt/user/appdata/photonix-mariadb:/var/lib/mysql
+      - /mnt/user/Database/cs/photonix-mariadb:/var/lib/mysql
+      - ./sql/init:/docker-entrypoint-initdb.d
+    ports:
+      - "13306:3306"
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --innodb-buffer-pool-size=256M
+      --max-connections=200
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "root", "-p${MARIADB_ROOT_PASSWORD:-photonix123456}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - photonix-network
+
   app:
     build:
       context: .
@@ -7,8 +35,8 @@ services:
     ports:
       - "${APP_PORT:-12080}:13001"
     volumes:
-      - /you/path:/app/photos
-      - ./data:/app/data
+      - /mnt/user/Database/WebDAV/99-待审文件/J059-医院医疗建筑设计方案文本:/app/photos
+      - /mnt/user/Database/cs/photonix-appdata:/app/data
     container_name: Photonix
     env_file:
       - ./.env
@@ -20,15 +48,13 @@ services:
       retries: 3
       start_period: 160s
     depends_on:
+      mariadb:
+        condition: service_healthy
       redis:
         condition: service_healthy
     networks:
       - photonix-network
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 4G
+
 
   redis:
     # Redis 服务，缓存和消息队列
@@ -52,6 +78,7 @@ services:
 # 卷定义
 volumes:
   redis_data:  # Redis 数据卷
+  mariadb_data:  # MariaDB 数据卷
 
 # 网络定义
 networks:

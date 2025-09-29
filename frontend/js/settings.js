@@ -296,7 +296,7 @@ function updateStatusRealtime(type, data) {
     }
 
     // 更新数值
-    const fields = ['processed', 'fts', 'total', 'files', 'unprocessed', 'sourceTotal'];
+    const fields = ['processed', 'total', 'files', 'unprocessed', 'sourceTotal'];
     fields.forEach(field => {
         if (data[field] !== undefined) {
             const element = document.getElementById(`${prefix}-${field}`);
@@ -345,6 +345,9 @@ function updateStatusRealtime(type, data) {
  * 开始实时进度监控
  */
 function startRealtimeMonitoring(type) {
+    // 先停止任何现有的监控
+    syncState.stopMonitoring();
+    
     // 使用状态管理类开始监控
     syncState.startMonitoring(type);
 
@@ -369,13 +372,13 @@ function startRealtimeMonitoring(type) {
                 // 根据类型获取对应的状态数据
                 switch (type) {
                     case 'index':
-                        statusData = data.index;
+                        statusData = data.data.index;
                         break;
                     case 'thumbnail':
-                        statusData = data.thumbnail;
+                        statusData = data.data.thumbnail;
                         break;
                     case 'hls':
-                        statusData = data.hls;
+                        statusData = data.data.hls;
                         break;
                 }
 
@@ -481,10 +484,6 @@ function renderIndexStatus(statusData) {
                 <div class="detail-item-new">
                     <span class="detail-label-new">已处理</span>
                     <span class="detail-value-new status-success" id="index-processed">${statusData.processedFiles || 0}</span>
-                </div>
-                <div class="detail-item-new">
-                    <span class="detail-label-new">FTS索引</span>
-                    <span class="detail-value-new status-success" id="index-fts">${statusData.ftsCount || 0}</span>
                 </div>
                 <div class="detail-item-new">
                     <span class="detail-label-new">总文件</span>

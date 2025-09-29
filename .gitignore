@@ -44,4 +44,4 @@ frontend/.parcel-cache/
 # Docker / Compose (local overrides)
 docker-compose.override.yml
 redis_data/
-
+.env

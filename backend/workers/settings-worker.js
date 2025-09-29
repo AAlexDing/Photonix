@@ -1,9 +1,9 @@
 const { parentPort } = require('worker_threads');
 const { Worker } = require('bullmq');
 const winston = require('winston');
-const { initializeConnections, getDB, runPreparedBatch } = require('../db/multi-db');
+const { initializeConnections, dbRun, runPreparedBatch } = require('../db/multi-db');
 const { redis } = require('../config/redis');
-const { runPreparedBatchWithRetry } = require('../db/sqlite-retry');
+const { runPreparedBatchWithRetry } = require('../db/database-retry');
 const { invalidateTags } = require('../services/cache.service.js');
 
 (async () => {
@@ -14,10 +14,6 @@ const { invalidateTags } = require('../services/cache.service.js');
         format: winston.format.combine(winston.format.colorize(), winston.format.timestamp(), winston.format.printf(info => `[${info.timestamp}] [SETTINGS-WORKER] ${info.level}: ${info.message}`)),
         transports: [new winston.transports.Console()]
     });
-    // --- 数据库配置 ---
-    const db = getDB('settings');
-
-    const dbRun = (sql, params = []) => new Promise((res, rej) => db.run(sql, params, function(err) { if (err) rej(err); else res(this); }));
 
     const tasks = {
         async update_settings({ settingsToUpdate, updateId } = {}) {
@@ -33,10 +29,10 @@ const { invalidateTags } = require('../services/cache.service.js');
             
             while (retryCount < maxRetries) {
                 try {
-                    const sql = 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)';
-                    const rows = Object.entries(settingsToUpdate).map(([k, v]) => [k, String(v)]);
+                    const sql = 'INSERT INTO settings (\`key\`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = ?';
+                    const rows = Object.entries(settingsToUpdate).map(([k, v]) => [k, String(v), String(v)]);
                     // 交由通用批处理托管事务
-                    await runPreparedBatchWithRetry(runPreparedBatch, 'settings', sql, rows, { chunkSize: 500 }, redis);
+                    await runPreparedBatchWithRetry('settings', sql, rows, { chunkSize: 500 });
 
                     logger.info('[SETTINGS-WORKER] 配置更新成功:', Object.keys(settingsToUpdate).join(', '));
 
@@ -62,7 +58,7 @@ const { invalidateTags } = require('../services/cache.service.js');
                 } catch (error) {
                     retryCount++;
                     
-                    if (error.message.includes('SQLITE_BUSY') && retryCount < maxRetries) {
+                    if ((error.message.includes('lock') || error.message.includes('timeout') || error.code === 'ER_LOCK_WAIT_TIMEOUT') && retryCount < maxRetries) {
                         const delay = retryCount * 2000;
                         logger.warn(`[SETTINGS-WORKER] 数据库繁忙，${delay}ms后重试 (${retryCount}/${maxRetries}): ${error.message}`);
                         await new Promise(resolve => setTimeout(resolve, delay));

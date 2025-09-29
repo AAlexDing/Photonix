@@ -32,7 +32,7 @@
 - **多数据库架构**：主数据库、设置数据库、历史记录数据库、索引数据库分离
 - **Redis 高性能缓存**：AI内容与搜索结果持久缓存
 - **Worker 线程池**：缩略图生成、AI处理、索引重建多线程并发
-- **智能索引**：SQLite FTS5全文搜索，支持模糊匹配
+- **智能索引**：MariaDB FULLTEXT全文搜索，支持模糊匹配
 
 ### 📱 用户体验
 - **PWA 支持**：可安装、离线访问，移动端手势切换
@@ -142,10 +142,9 @@ Photonix/
 │   │   ├── settings.controller.js       # 设置读写（过滤敏感项）
 │   │   └── thumbnail.controller.js      # 缩略图获取：exists/processing/failed 占位
 │   ├── db/
-│   │   ├── migrate-to-multi-db.js       # 单库→多库迁移脚本
 │   │   ├── migrations.js                # 多库初始化与核心表兜底
-│   │   ├── multi-db.js                  # SQLite 连接管理与通用查询
-│   │   ├── sqlite-retry.js              # SQLite 重试机制
+│   │   ├── multi-db.js                  # MariaDB 连接管理与通用查询
+│   │   ├── database-retry.js            # 数据库重试机制
 │   │   └── README.md                    # 多库说明
 │   ├── middleware/
 │   │   ├── ai-rate-guard.js             # AI 配额/冷却/去重（Redis）
@@ -172,7 +171,7 @@ Photonix/
 │   │   ├── event.service.js             # 事件总线（SSE）
 │   │   ├── file.service.js              # 文件与封面相关逻辑
 │   │   ├── indexer.service.js           # 监控目录/合并变更/索引调度
-│   │   ├── search.service.js            # 搜索实现（FTS5 等）
+│   │   ├── search.service.js            # 搜索实现（FULLTEXT 等）
 │   │   ├── settings.service.js          # 设置缓存（内存/Redis）与持久化
 │   │   ├── thumbnail.service.js         # 缩略图高/低优队列与重试
 │   │   └── worker.manager.js            # Worker 管理（缩略图/索引/视频）
@@ -260,10 +259,10 @@ Photonix/
 
 项目采用多数据库架构，提高并发性能：
 
-- **主数据库** (`gallery.db`)：存储图片和视频元数据、路径信息
-- **设置数据库** (`settings.db`)：存储应用配置、AI设置、用户偏好
-- **历史记录数据库** (`history.db`)：存储用户浏览历史和搜索记录
-- **索引数据库** (`index.db`)：存储搜索索引状态、队列任务、处理进度
+- **主数据库** (`photonix_main`)：存储图片和视频元数据、路径信息
+- **设置数据库** (`photonix_settings`)：存储应用配置、AI设置、用户偏好
+- **历史记录数据库** (`photonix_history`)：存储用户浏览历史和搜索记录
+- **索引数据库** (`photonix_index`)：存储搜索索引状态、队列任务、处理进度
 
 #### 数据库特性
 - **并发优化**：多库设计减少锁竞争，提升并发性能
@@ -398,10 +397,10 @@ npx http-server -p 8000
 ### 数据库管理
 ```bash
 # 查看数据库状态
-sqlite3 data/gallery.db ".tables"
+docker exec photonix-mariadb mysql -uphotonix -pphotonix123456 photonix_main -e "SHOW TABLES;"
 
-# 手动执行数据迁移
-node backend/db/migrate-to-multi-db.js
+# 连接数据库管理
+docker exec -it photonix-mariadb mysql -uphotonix -pphotonix123456
 ```
 
 ### 启动期回填任务（降低运行时 IO）
@@ -441,7 +440,7 @@ node backend/db/migrate-to-multi-db.js
 
 ### 健康检查
 - **端点**：`/health`
-- **检查项**：SQLite 可用性（查询 items 与 items_fts 的 COUNT），异常视为不健康
+- **检查项**：MariaDB 可用性（查询 items 表的 COUNT），异常视为不健康
 - **响应**：成功返回 200 和计数；异常返回 503（包含错误信息）
 
 ### 性能指标
@@ -455,7 +454,7 @@ node backend/db/migrate-to-multi-db.js
 - **日志轮转**：Docker 日志轮转配置
 
 ### 数据备份
-- **数据库备份**：定期备份 SQLite 数据库文件
+- **数据库备份**：定期备份 MariaDB 数据库（mysqldump）
 - **照片备份**：定期备份照片目录
 - **配置备份**：备份 `.env` 和 Docker 配置文件
 
@@ -493,7 +492,7 @@ Photonix 的核心特色功能，通过 AI 让照片中的人物"开口说话"�
 - **错误处理**：自动重试机制，确保生成成功
 
 ### 智能索引系统
-- SQLite FTS5全文搜索，支持中文分词
+- MariaDB FULLTEXT全文搜索，支持中文分词
 - 多线程索引重建，提高处理速度
 - 文件监控自动更新索引
 - 支持相册和视频的智能搜索
@@ -567,7 +566,7 @@ docker compose logs -f
 
 ### 数据迁移
 - **自动迁移**：应用启动时自动执行数据库迁移
-- **手动迁移**：可手动执行 `node backend/db/migrate-to-multi-db.js`
+- **数据库管理**：通过Docker Compose自动管理MariaDB服务
 - **回滚支持**：迁移失败时自动回滚，保证数据安全
 
 ## 🚀 性能优化建议

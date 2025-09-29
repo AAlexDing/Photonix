@@ -177,14 +177,12 @@ app.get('/health', async (req, res) => {
     try {
         const { dbAll } = require('./db/multi-db');
         const itemCount = await dbAll('main', "SELECT COUNT(*) as count FROM items");
-        const ftsCount = await dbAll('main', "SELECT COUNT(*) as count FROM items_fts");
         
         res.json({
             status: 'ok',
             timestamp: new Date().toISOString(),
             database: {
-                items: itemCount[0].count,
-                fts: ftsCount[0].count
+                items: itemCount[0].count
             }
         });
     } catch (error) {
@@ -253,7 +251,7 @@ app.use((err, req, res, next) => {
         message = '访问被拒绝';
     }
     // 处理数据库错误
-    else if (err.message && err.message.includes('SQLITE_')) {
+    else if (err.code === 'MARIADB_TIMEOUT' || err.message && (err.message.includes('Connection') || err.message.includes('ER_'))) {
         statusCode = 500;
         errorCode = 'DATABASE_ERROR';
         message = '数据库操作失败';

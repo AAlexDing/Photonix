@@ -17,7 +17,7 @@ echo "📁 正在配置数据目录权限..."
 chown -R node:node /app/data
 
 # 先确保后端依赖就绪（自愈：若缺失则自动安装）
-if [ ! -f "/app/backend/node_modules/express/package.json" ] || [ ! -f "/app/backend/node_modules/sqlite3/package.json" ] || [ ! -f "/app/backend/node_modules/bullmq/package.json" ]; then
+if [ ! -f "/app/backend/node_modules/express/package.json" ] || [ ! -f "/app/backend/node_modules/mysql2/package.json" ] || [ ! -f "/app/backend/node_modules/bullmq/package.json" ]; then
   echo "📦 检测到依赖缺失，正在安装后端依赖（使用国内镜像）..."
   cd /app/backend
   npm config set registry https://registry.npmmirror.com
@@ -26,8 +26,7 @@ if [ ! -f "/app/backend/node_modules/express/package.json" ] || [ ! -f "/app/bac
   cd /app
 fi
 
-echo "🗄️ 正在检查数据库迁移..."
-node /app/backend/db/migrate-to-multi-db.js || echo "数据库迁移脚本执行失败或无需执行，继续启动..."
+echo "🗄️ MariaDB数据库将在应用启动时自动初始化..."
 echo "✅ 环境配置完成，正在启动应用程序..."
 
 # 使用 gosu 切换到 node 用户，并使用 pm2-runtime 启动在 ecosystem.config.js 中定义的所有应用。

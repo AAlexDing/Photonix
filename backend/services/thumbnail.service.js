@@ -9,7 +9,7 @@ const logger = require('../config/logger');
 const { redis } = require('../config/redis');
 const { THUMBS_DIR, MAX_THUMBNAIL_RETRIES, INITIAL_RETRY_DELAY, NUM_WORKERS } = require('../config');
 const { idleThumbnailWorkers } = require('./worker.manager');
-const { writeThumbStatusWithRetry: writeThumbStatusWithRetryNew, runPreparedBatchWithRetry } = require('../db/sqlite-retry');
+const { writeThumbStatusWithRetry: writeThumbStatusWithRetryNew, runPreparedBatchWithRetry } = require('../db/database-retry');
 const { dbRun } = require('../db/multi-db');
 const eventBus = require('./event.service');
 
@@ -127,12 +127,12 @@ async function flushThumbStatusBatch() {
         try {
             const { runPreparedBatch } = require('../db/multi-db');
             const upsertSql = `INSERT INTO thumb_status(path, mtime, status, last_checked)
-                               VALUES(?, ?, ?, strftime('%s','now')*1000)
-                               ON CONFLICT(path) DO UPDATE SET
-                                   mtime=excluded.mtime,
-                                   status=excluded.status,
-                                   last_checked=excluded.last_checked`;
-            await runPreparedBatchWithRetry(runPreparedBatch, 'main', upsertSql, rows, { chunkSize: 200 }, redis);
+                               VALUES(?, ?, ?, UNIX_TIMESTAMP()*1000)
+                               ON DUPLICATE KEY UPDATE
+                                   mtime=VALUES(mtime),
+                                   status=VALUES(status),
+                                   last_checked=VALUES(last_checked)`;
+            await runPreparedBatchWithRetry('main', upsertSql, rows, { chunkSize: 200 });
             logger.debug(`[THUMB] 批量写入缩略图状态成功: ${rows.length} 条记录`);
         } catch (e) {
             logger.warn(`批量写入缩略图状态失败，回退为逐条重试: ${e.message}`);

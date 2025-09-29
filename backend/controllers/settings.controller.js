@@ -290,16 +290,12 @@ async function getIndexStatus() {
         // 获取items表统计信息
         const itemsStats = await dbAll('main', "SELECT type, COUNT(*) as count FROM items GROUP BY type");
 
-        // 获取FTS表统计信息
-        const ftsStats = await dbAll('main', "SELECT COUNT(*) as count FROM items_fts");
-
         return {
             status: statusRow?.status || 'unknown',
             processedFiles: statusRow?.processed_files || 0,
             totalFiles: statusRow?.total_files || 0,
             lastUpdated: statusRow?.last_updated || null,
-            itemsStats: itemsStats || [],
-            ftsCount: ftsStats?.[0]?.count || 0
+            itemsStats: itemsStats || []
         };
     } catch (error) {
         logger.warn('获取索引状态失败:', error);
@@ -308,8 +304,7 @@ async function getIndexStatus() {
             error: error.message,
             processedFiles: 0,
             totalFiles: 0,
-            itemsStats: [],
-            ftsCount: 0
+            itemsStats: []
         };
     }
 }
@@ -366,7 +361,8 @@ async function resyncThumbnailStatus() {
                 // 插入到数据库
                 await dbRun('main', `
                     INSERT INTO thumb_status (path, mtime, status, last_checked)
-                    VALUES (?, 0, ?, strftime('%s','now')*1000)
+                    VALUES (?, 0, ?, UNIX_TIMESTAMP()*1000)
+                    ON DUPLICATE KEY UPDATE status = VALUES(status), last_checked = VALUES(last_checked)
                 `, [file.path, status]);
 
                 syncedCount++;
@@ -595,7 +591,7 @@ async function performThumbnailReconcile() {
                 // 源文件存在，将状态更新为 pending
                 await runAsync('main', `
                     UPDATE thumb_status 
-                    SET status = 'pending', last_checked = strftime('%s','now')*1000 
+                    SET status = 'pending', last_checked = UNIX_TIMESTAMP()*1000 
                     WHERE path = ?
                 `, [row.path]);
                 

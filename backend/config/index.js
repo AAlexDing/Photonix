@@ -15,10 +15,19 @@ const PHOTOS_DIR = process.env.PHOTOS_DIR || '/app/photos'; // 图片/视频主�
 const DATA_DIR = process.env.DATA_DIR || '/app/data';       // 数据存储目录
 
 // --- 数据库配置 ---
-const DB_FILE = path.resolve(DATA_DIR, 'gallery.db');         // 主数据库
-const SETTINGS_DB_FILE = path.resolve(DATA_DIR, 'settings.db'); // 设置数据库
-const HISTORY_DB_FILE = path.resolve(DATA_DIR, 'history.db');   // 历史记录数据库
-const INDEX_DB_FILE = path.resolve(DATA_DIR, 'index.db');       // 索引数据库
+// MariaDB连接配置
+const MARIADB_HOST = process.env.MARIADB_HOST || 'localhost';
+const MARIADB_PORT = parseInt(process.env.MARIADB_PORT) || 3306;
+const MARIADB_USER = process.env.MARIADB_USER || 'photonix';
+const MARIADB_PASSWORD = process.env.MARIADB_PASSWORD || '';
+const MARIADB_ROOT_PASSWORD = process.env.MARIADB_ROOT_PASSWORD || '';
+
+// 数据库名称配置
+const DB_MAIN = process.env.DB_MAIN || 'photonix_main';
+const DB_SETTINGS = process.env.DB_SETTINGS || 'photonix_settings';  
+const DB_HISTORY = process.env.DB_HISTORY || 'photonix_history';
+const DB_INDEX = process.env.DB_INDEX || 'photonix_index';
+
 const THUMBS_DIR = path.resolve(DATA_DIR, 'thumbnails');        // 缩略图存储目录
 
 // --- Redis配置 ---
@@ -134,11 +143,18 @@ module.exports = {
     DATA_DIR,
     THUMBS_DIR,
 
-    // 数据库配置
-    DB_FILE,
-    SETTINGS_DB_FILE,
-    HISTORY_DB_FILE,
-    INDEX_DB_FILE,
+    // MariaDB配置
+    MARIADB_HOST,
+    MARIADB_PORT,
+    MARIADB_USER,
+    MARIADB_PASSWORD,
+    MARIADB_ROOT_PASSWORD,
+    
+    // 数据库名称
+    DB_MAIN,
+    DB_SETTINGS,
+    DB_HISTORY,
+    DB_INDEX,
 
     // Redis配置
     REDIS_URL,

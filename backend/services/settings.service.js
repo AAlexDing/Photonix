@@ -73,7 +73,7 @@ async function getAllSettings(options = {}) {
 
         // 3) 缓存无效，从数据库读取
         logger.debug('从设置数据库获取设置');
-        const rows = await dbAll('settings', 'SELECT key, value FROM settings');
+        const rows = await dbAll('settings', 'SELECT `key`, value FROM settings');
         const settings = {};
         for (const row of rows) {
             settings[row.key] = row.value;
@@ -127,30 +127,20 @@ async function getAllSettings(options = {}) {
  */
 async function updateSettings(settingsToUpdate) {
     // 使用事务确保原子性
-    await dbRun('settings', 'BEGIN TRANSACTION');
+    await dbRun('settings', 'START TRANSACTION');
     try {
-        // 使用 prepare 可以提高批量操作的性能
-        const db = getDB('settings');
-        const updateStmt = db.prepare('INSERT OR REPLACE INTO settings (value, key) VALUES (?, ?)');
-        
-        // 批量更新设置项
-        for (const [key, value] of Object.entries(settingsToUpdate)) {
-            // 使用 Promise 包装回调式的 run 方法
-            await new Promise((resolve, reject) => {
-                updateStmt.run(value, key, (err) => {
-                    if (err) return reject(err);
-                    resolve();
-                });
-            });
+        // 使用批量操作替代prepared statements
+        const entries = Object.entries(settingsToUpdate);
+        if (entries.length > 0) {
+            const placeholders = entries.map(() => '(?, ?)').join(', ');
+            const flatValues = entries.map(([key, value]) => [key, value]).flat();
+            
+            await dbRun('settings', 
+                'INSERT INTO settings (`key`, value) VALUES ' + placeholders + 
+                ' ON DUPLICATE KEY UPDATE value = VALUES(value)',
+                flatValues
+            );
         }
-        
-        // 完成所有 run 操作后，finalize a prepared statement
-        await new Promise((resolve, reject) => {
-            updateStmt.finalize((err) => {
-                if(err) return reject(err);
-                resolve();
-            });
-        });
 
         // 提交事务
         await dbRun('settings', 'COMMIT');

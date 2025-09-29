@@ -18,15 +18,13 @@ const app = require('./app');
 const { promises: fs } = require('fs');
 const path = require('path');
 const logger = require('./config/logger');
-const { PORT, THUMBS_DIR, DB_FILE, SETTINGS_DB_FILE, HISTORY_DB_FILE, INDEX_DB_FILE, PHOTOS_DIR, DATA_DIR } = require('./config');
+const { PORT, THUMBS_DIR, PHOTOS_DIR, DATA_DIR } = require('./config');
 const { initializeConnections, closeAllConnections } = require('./db/multi-db');
 const { initializeAllDBs, ensureCoreTables } = require('./db/migrations');
-const { migrateToMultiDB } = require('./db/migrate-to-multi-db');
 const { createThumbnailWorkerPool, ensureCoreWorkers, getVideoWorker } = require('./services/worker.manager');
 const { startAdaptiveScheduler } = require('./services/adaptive.service');
 const { setupThumbnailWorkerListeners, startIdleThumbnailGeneration } = require('./services/thumbnail.service');
 const { setupWorkerListeners, buildSearchIndex, watchPhotosDir } = require('./services/indexer.service');
-const sqlite3 = require('sqlite3');
 
 /**
  * 检测 `THUMBS_DIR` 是否几乎为空（快速早停）
@@ -57,7 +55,7 @@ async function isThumbsDirEffectivelyEmpty(rootDir) {
         // 从 DB 抽样 50 条 exists 路径，映射到缩略图路径，检查是否存在任意一个
         try {
             const { dbAll } = require('./db/multi-db');
-            const rows = await dbAll('main', `SELECT path FROM thumb_status WHERE status='exists' ORDER BY RANDOM() LIMIT 50`);
+            const rows = await dbAll('main', `SELECT path FROM thumb_status WHERE status='exists' ORDER BY RAND() LIMIT 50`);
             if (!rows || rows.length === 0) return true; // 无数据等同空
             for (const r of rows) {
                 const isVideo = /\.(mp4|webm|mov)$/i.test(r.path || '');
@@ -128,39 +126,8 @@ async function startServer() {
 		await fs.mkdir(THUMBS_DIR, { recursive: true });
 		await checkDirectoryWritable(THUMBS_DIR);
 
-		// 2. 检查是否需要从旧版 gallery.db 迁移
-        const oldDbExists = require('fs').existsSync(DB_FILE);
-        const newDbExists = require('fs').existsSync(SETTINGS_DB_FILE);
-        let isMigrationNeeded = false;
-
-        if (oldDbExists && !newDbExists) {
-            // 旧DB文件存在，但新DB文件不存在。需要进一步检查旧DB是否为空
-            const db = new sqlite3.Database(DB_FILE);
-            const tables = await new Promise((resolve, reject) => {
-                db.all("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], (err, rows) => {
-                    if (err) return reject(err);
-                    resolve(rows);
-                });
-            });
-            db.close();
-
-            if (tables.length > 0) {
-                isMigrationNeeded = true;
-            }
-        }
-
-		if (isMigrationNeeded) {
-			logger.info('检测到包含数据的旧版数据库 gallery.db，将执行一次性迁移...');
-			await migrateToMultiDB();
-		} else {
-            if (oldDbExists && !newDbExists) {
-                logger.info('检测到空的或无效的旧版数据库文件 gallery.db，将忽略并进行全新初始化。');
-            } else {
-                logger.info('数据库结构已是多库架构，无需迁移。');
-            }
-		}
-
-        // 3. DB 初始化 (无论是否迁移，都确保初始化)
+        // 2. MariaDB 数据库初始化
+        logger.info('初始化MariaDB数据库连接...');
         await initializeConnections();
         await initializeAllDBs();
         await ensureCoreTables();
@@ -192,7 +159,7 @@ async function startServer() {
 			let hasResumePoint = false;
 			try {
 				const statusRow = await dbGet('index', "SELECT status FROM index_status WHERE id = 1");
-				const resumeRow = await dbGet('index', "SELECT value FROM index_progress WHERE key = 'last_processed_path'");
+				const resumeRow = await dbGet('index', "SELECT value FROM index_progress WHERE `key` = 'last_processed_path'");
 				hasResumePoint = (statusRow && statusRow.status === 'building') || !!(resumeRow && resumeRow.value);
 			} catch {}
 
@@ -226,8 +193,7 @@ async function startServer() {
 			try {
 				const { dbAll } = require('./db/multi-db');
 				const itemCount = await dbAll('main', "SELECT COUNT(*) as count FROM items");
-				const ftsCount = await dbAll('main', "SELECT COUNT(*) as count FROM items_fts");
-				logger.debug(`索引状态检查 - items表: ${itemCount[0].count} 条记录, FTS表: ${ftsCount[0].count} 条记录`);
+				logger.debug(`索引状态检查 - items表: ${itemCount[0].count} 条记录`);
 			} catch (error) {
 				logger.debug('索引状态检查失败（降噪）：', error && error.message);
 			}

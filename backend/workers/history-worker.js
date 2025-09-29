@@ -1,9 +1,9 @@
 const { parentPort } = require('worker_threads');
 const path = require('path');
 const winston = require('winston');
-const { initializeConnections, getDB, runPreparedBatch } = require('../db/multi-db');
+const { initializeConnections, dbRun, runPreparedBatch } = require('../db/multi-db');
 const { redis } = require('../config/redis');
-const { runPreparedBatchWithRetry } = require('../db/sqlite-retry');
+const { runPreparedBatchWithRetry } = require('../db/database-retry');
 
 (async () => {
     await initializeConnections();
@@ -18,11 +18,6 @@ const { runPreparedBatchWithRetry } = require('../db/sqlite-retry');
         format: winston.format.combine(winston.format.colorize(), winston.format.timestamp(), winston.format.printf(info => `[${info.timestamp}] [HISTORY-WORKER] ${info.level}: ${info.message}`)),
         transports: [new winston.transports.Console()]
     });
-    // --- 数据库配置 ---
-    const db = getDB('history');
-
-    // --- 辅助函数 ---
-    const dbRun = (sql, params = []) => new Promise((res, rej) => db.run(sql, params, function(err) { if (err) rej(err); else res(this); }));
 
     // --- 历史记录任务处理器 ---
     const tasks = {
@@ -38,9 +33,9 @@ const { runPreparedBatchWithRetry } = require('../db/sqlite-retry');
                     if (p) pathsToUpdate.push(p);
                 }
                 // 批量执行所有更新（交由通用批处理托管事务）
-                const sql = "INSERT OR REPLACE INTO view_history (user_id, item_path, viewed_at) VALUES (?, ?, CURRENT_TIMESTAMP)";
+                const sql = "INSERT INTO view_history (user_id, item_path, viewed_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON DUPLICATE KEY UPDATE viewed_at = CURRENT_TIMESTAMP";
                 const rows = pathsToUpdate.map(p => [userId, p]);
-                await runPreparedBatchWithRetry(runPreparedBatch, 'history', sql, rows, { chunkSize: 800 }, redis);
+                await runPreparedBatchWithRetry('history', sql, rows, { chunkSize: 800 });
                 
                 logger.debug(`[HISTORY-WORKER] 批量更新了 ${pathsToUpdate.length} 个路径的查看时间 for user ${userId}`);
 

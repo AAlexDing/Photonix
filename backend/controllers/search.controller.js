@@ -20,8 +20,7 @@ exports.searchItems = async (req, res) => {
     // 检查索引是否就绪
     try {
         const itemCount = await dbAll('main', "SELECT COUNT(*) as count FROM items");
-        const ftsCount = await dbAll('main', "SELECT COUNT(*) as count FROM items_fts");
-        if (!itemCount || !ftsCount || itemCount[0].count === 0 || ftsCount[0].count === 0) {
+        if (!itemCount || itemCount[0].count === 0) {
             return res.status(503).json({ code: 'SEARCH_UNAVAILABLE', message: '搜索索引正在构建中，请稍后再试', requestId: req.requestId });
         }
     } catch (error) {

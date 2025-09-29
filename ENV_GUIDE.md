@@ -147,23 +147,23 @@
 - 代码引用：backend/config/index.js、workers/thumbnail-worker.js、workers/indexing-worker.js
 - 示例：SHARP_CONCURRENCY=2
 
-5) SQLITE_BUSY_TIMEOUT
-- 作用：SQLite 忙等待超时（ms）
-- 默认值：20000（生产）/ 10000（开发）
-- 取值/格式：>=1000
-- 推荐修改场景：NFS/慢盘
-- 风险：过低易失败；过高延迟故障显现
-- 代码引用：backend/db/multi-db.js
-- 示例：SQLITE_BUSY_TIMEOUT=20000
-
-6) SQLITE_QUERY_TIMEOUT
-- 作用：SQLite 查询超时（ms）
+5) MARIADB_QUERY_TIMEOUT
+- 作用：MariaDB 查询超时（ms）
 - 默认值：30000（生产）/ 15000（开发）
 - 取值/格式：>=5000
-- 推荐修改场景：大查询/慢盘
+- 推荐修改场景：大查询/网络延迟
 - 风险：过低易中断；过高延迟反馈
 - 代码引用：backend/db/multi-db.js
-- 示例：SQLITE_QUERY_TIMEOUT=30000
+- 示例：MARIADB_QUERY_TIMEOUT=30000
+
+6) MARIADB_HOST
+- 作用：MariaDB 服务器地址
+- 默认值：mariadb（Docker）/ localhost（本地）
+- 取值/格式：主机名或IP地址
+- 推荐修改场景：外部数据库服务器
+- 风险：错误地址导致连接失败
+- 代码引用：backend/config/index.js、backend/db/multi-db.js
+- 示例：MARIADB_HOST=mariadb
 
 7) RATE_LIMIT_WINDOW_MINUTES
 - 作用：API 限流窗口（分钟）
@@ -340,8 +340,7 @@ FFMPEG_THREADS=1
 SHARP_CONCURRENCY=1
 
 # 数据库优化（低配环境）
-SQLITE_BUSY_TIMEOUT=30000
-SQLITE_QUERY_TIMEOUT=45000
+MARIADB_QUERY_TIMEOUT=45000
 SETTINGS_REDIS_CACHE=true
 
 # 限流收紧（保护低配环境）
@@ -388,8 +387,7 @@ ADMIN_SECRET=<强口令>
 WORKER_MEMORY_MB=384
 FFMPEG_THREADS=1
 SHARP_CONCURRENCY=1
-SQLITE_BUSY_TIMEOUT=20000
-SQLITE_QUERY_TIMEOUT=30000
+MARIADB_QUERY_TIMEOUT=30000
 SETTINGS_REDIS_CACHE=true
 
 # NFS/网络盘建议
@@ -416,8 +414,7 @@ DISABLE_WATCH=true
 WATCH_USE_POLLING=true
 WATCH_POLL_INTERVAL=2000
 WATCH_POLL_BINARY_INTERVAL=3000
-SQLITE_BUSY_TIMEOUT=30000
-SQLITE_QUERY_TIMEOUT=60000
+MARIADB_QUERY_TIMEOUT=60000
 ```
 
 ---
@@ -475,5 +472,5 @@ $env:PORT="13001"; $env:NODE_ENV="production"; node backend/server.js
 通用问题：
 - 401/无法登录：检查 JWT_SECRET/ADMIN_SECRET 注入
 - Redis 连接失败：确认 REDIS_URL 与容器网络/密码
-- 访问慢/超时：增大 SQLITE_* 超时，降低 SHARP_CONCURRENCY/FFMPEG_THREADS
+- 访问慢/超时：增大 MARIADB_QUERY_TIMEOUT，降低 SHARP_CONCURRENCY/FFMPEG_THREADS
 - NFS 丢事件：启用 WATCH_USE_POLLING 并提高轮询间隔

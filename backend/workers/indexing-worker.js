@@ -14,7 +14,7 @@ try {
 } catch {}
 const { initializeConnections, getDB, dbRun, dbGet, runPreparedBatch, adaptDbTimeouts } = require('../db/multi-db');
 const { redis } = require('../config/redis');
-const { runPreparedBatchWithRetry } = require('../db/sqlite-retry');
+const { runPreparedBatchWithRetry } = require('../db/database-retry');
 const { createNgrams } = require('../utils/search.utils');
 const { getVideoDimensions } = require('../utils/media.utils.js');
 const { invalidateTags } = require('../services/cache.service.js');
@@ -34,7 +34,7 @@ const { invalidateTags } = require('../services/cache.service.js');
     const CACHE_TTL = 1000 * 60 * 10;
 
     try {
-        await dbRun('index', `CREATE TABLE IF NOT EXISTS index_progress (key TEXT PRIMARY KEY, value TEXT);`);
+        await dbRun('index', `CREATE TABLE IF NOT EXISTS index_progress (\`key\` VARCHAR(255) PRIMARY KEY, value TEXT);`);
     } catch (e) {
         logger.error('创建 index_progress 表失败:', e);
     }
@@ -43,11 +43,12 @@ const { invalidateTags } = require('../services/cache.service.js');
     async function ensureAlbumCoversTable() {
         try {
             await dbRun('main', `CREATE TABLE IF NOT EXISTS album_covers (
-                album_path TEXT PRIMARY KEY,
-                cover_path TEXT NOT NULL,
-                width INTEGER NOT NULL,
-                height INTEGER NOT NULL,
-                mtime INTEGER NOT NULL
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                album_path VARCHAR(768) NOT NULL UNIQUE,
+                cover_path VARCHAR(768) NOT NULL,
+                width INT NOT NULL,
+                height INT NOT NULL,
+                mtime BIGINT NOT NULL
             );`);
             await dbRun('main', `CREATE INDEX IF NOT EXISTS idx_album_covers_album_path ON album_covers(album_path);`);
         } catch (e) {
@@ -110,11 +111,11 @@ const { invalidateTags } = require('../services/cache.service.js');
             // 批量写入（UPSERT）— 统一使用通用 Prepared 批处理
             const upsertSql = `INSERT INTO album_covers (album_path, cover_path, width, height, mtime)
                                VALUES (?, ?, ?, ?, ?)
-                               ON CONFLICT(album_path) DO UPDATE SET
-                                   cover_path=excluded.cover_path,
-                                   width=excluded.width,
-                                   height=excluded.height,
-                                   mtime=excluded.mtime`;
+                               ON DUPLICATE KEY UPDATE
+                                   cover_path=VALUES(cover_path),
+                                   width=VALUES(width),
+                                   height=VALUES(height),
+                                   mtime=VALUES(mtime)`;
             const rows = Array.from(coverMap.entries()).map(([albumPath, info]) => [
                 albumPath,
                 info.cover_path,
@@ -122,7 +123,7 @@ const { invalidateTags } = require('../services/cache.service.js');
                 info.height,
                 info.mtime
             ]);
-            await runPreparedBatchWithRetry(runPreparedBatch, 'main', upsertSql, rows, { chunkSize: 800 }, redis);
+            await runPreparedBatchWithRetry('main', upsertSql, rows, { chunkSize: 800 });
 
             const dt = ((Date.now() - t0) / 1000).toFixed(1);
             logger.info(`[INDEXING-WORKER] album_covers 重建完成，用时 ${dt}s，生成 ${coverMap.size} 条。`);
@@ -222,7 +223,7 @@ const { invalidateTags } = require('../services/cache.service.js');
         async rebuild_index({ photosDir }) {
             logger.info('[INDEXING-WORKER] 开始执行索引重建任务...');
             try {
-                const resumeRow = await dbGet('index', "SELECT value FROM index_progress WHERE key = 'last_processed_path'");
+                const resumeRow = await dbGet('index', "SELECT value FROM index_progress WHERE `key` = 'last_processed_path'");
                 const lastProcessedPath = resumeRow ? resumeRow.value : null;
 
                 if (lastProcessedPath) {
@@ -232,17 +233,15 @@ const { invalidateTags } = require('../services/cache.service.js');
                     await dbRun('index', "DELETE FROM index_status");
                     await dbRun('index', "INSERT INTO index_status (id, status, processed_files) VALUES (1, 'building', 0)");
                     await dbRun('main', "DELETE FROM items");
-                    await dbRun('main', "DELETE FROM items_fts");
                 }
 
                 const statusRow = await dbGet('index', "SELECT processed_files FROM index_status WHERE id = 1");
                 let count = statusRow ? statusRow.processed_files : 0;
                 const batchSize = 1000;
                 
-                // 使用 OR IGNORE 避免断点续跑时重复插入 items；FTS 使用 OR REPLACE 确保令牌更新
-                const itemsStmt = getDB('main').prepare("INSERT OR IGNORE INTO items (name, path, type, mtime, width, height) VALUES (?, ?, ?, ?, ?, ?)");
-                const thumbUpsertStmt = getDB('main').prepare("INSERT INTO thumb_status(path, mtime, status, last_checked) VALUES(?, ?, 'pending', 0) ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, status='pending'");
-                const ftsStmt = getDB('main').prepare("INSERT OR REPLACE INTO items_fts (rowid, name) VALUES (?, ?)");
+                // 使用批量操作避免prepared statements
+                const itemsValues = [];
+                const thumbValues = [];
                 
                 let batch = [];
                 let shouldProcess = !lastProcessedPath;
@@ -256,13 +255,13 @@ const { invalidateTags } = require('../services/cache.service.js');
                     batch.push(item);
                     if (batch.length >= batchSize) {
                         const processedBatch = await processDimensionsInParallel(batch, photosDir);
-                        await dbRun('main', 'BEGIN IMMEDIATE');
+                        await dbRun('main', 'START TRANSACTION');
                         try {
-                            await tasks.processBatchInTransactionOptimized(processedBatch, itemsStmt, ftsStmt, thumbUpsertStmt);
+                            await tasks.processBatchInTransactionOptimized(processedBatch);
                             await dbRun('main', 'COMMIT');
                             const lastItemInBatch = processedBatch[processedBatch.length - 1];
                             if (lastItemInBatch) {
-                                await dbRun('index', "INSERT OR REPLACE INTO index_progress (key, value) VALUES ('last_processed_path', ?)", [lastItemInBatch.path]);
+                                await dbRun('index', "INSERT INTO index_progress (`key`, value) VALUES ('last_processed_path', ?) ON DUPLICATE KEY UPDATE value = ?", [lastItemInBatch.path, lastItemInBatch.path]);
                             }
                         } catch (e) {
                             await dbRun('main', 'ROLLBACK').catch(()=>{});
@@ -276,9 +275,9 @@ const { invalidateTags } = require('../services/cache.service.js');
                 }
                 if (batch.length > 0) {
                     const processedBatch = await processDimensionsInParallel(batch, photosDir);
-                    await dbRun('main', 'BEGIN IMMEDIATE');
+                    await dbRun('main', 'START TRANSACTION');
                     try {
-                        await tasks.processBatchInTransactionOptimized(processedBatch, itemsStmt, ftsStmt, thumbUpsertStmt);
+                        await tasks.processBatchInTransactionOptimized(processedBatch);
                         await dbRun('main', 'COMMIT');
                     } catch (e) {
                         await dbRun('main', 'ROLLBACK').catch(()=>{});
@@ -288,11 +287,7 @@ const { invalidateTags } = require('../services/cache.service.js');
                     await dbRun('index', "UPDATE index_status SET processed_files = ? WHERE id = 1", [count]);
                 }
                 
-                await new Promise((resolve, reject) => itemsStmt.finalize(err => err ? reject(err) : resolve()));
-                await new Promise((resolve, reject) => ftsStmt.finalize(err => err ? reject(err) : resolve()));
-                await new Promise((resolve, reject) => thumbUpsertStmt.finalize(err => err ? reject(err) : resolve()));
-                
-                await dbRun('index', "DELETE FROM index_progress WHERE key = 'last_processed_path'");
+                await dbRun('index', "DELETE FROM index_progress WHERE `key` = 'last_processed_path'");
                 await dbRun('index', "UPDATE index_status SET status = 'complete', processed_files = ? WHERE id = 1", [count]);
 
                 logger.info(`[INDEXING-WORKER] 索引重建完成，共处理 ${count} 个条目。`);
@@ -307,45 +302,47 @@ const { invalidateTags } = require('../services/cache.service.js');
             }
         },
         
-        async processBatchInTransactionOptimized(processedBatch, itemsStmt, ftsStmt, thumbUpsertStmt) {
+        async processBatchInTransactionOptimized(processedBatch) {
+            if (processedBatch.length === 0) return;
+            
+            // 准备批量插入数据
+            const itemValues = [];
+            const thumbValues = [];
+            
             for (const item of processedBatch) {
-                // 1) 尝试插入 items（OR IGNORE）
-                const insertRes = await new Promise((resolve, reject) => {
-                    itemsStmt.run(item.name, item.path, item.type, item.mtime, item.width, item.height, function(err) {
-                        if (err) return reject(err);
-                        resolve({ lastID: this.lastID, changes: this.changes });
-                    });
-                });
-
-                // 2) 获取 rowid：若忽略（已存在），查询现有 id
-                let rowId = insertRes.lastID;
-                if (!rowId) {
-                    const existing = await dbGet('main', 'SELECT id FROM items WHERE path = ?', [item.path]).catch(() => null);
-                    rowId = existing && existing.id ? existing.id : null;
-                    if (!rowId) {
-                        // 理论上不应发生；安全跳过以防止崩溃
-                        continue;
-                    }
-                }
-
-                // 3) 写入/更新 FTS 令牌（OR REPLACE）
-                const baseText = item.path.replace(/\.[^.]+$/, '').replace(/[\/\\]/g, ' ');
-                const typeLabel = item.type === 'video' ? ' video' : ' photo';
-                const searchableText = baseText + typeLabel;
-                const tokenizedName = createNgrams(searchableText, 1, 2);
-                await new Promise((resolve, reject) => {
-                    ftsStmt.run(rowId, tokenizedName, (err) => {
-                         if (err) return reject(err);
-                         resolve();
-                    });
-                });
-
-                // 4) 标记缩略图状态（只在 photo/video 上更新）
+                // 准备items表数据 - 使用ON DUPLICATE KEY UPDATE代替OR IGNORE
+                itemValues.push([
+                    item.name, item.path, item.type, item.mtime, item.width, item.height
+                ]);
+                
+                // 准备缩略图状态数据 - 只对照片和视频
                 if (item.type === 'photo' || item.type === 'video') {
-                    await new Promise((resolve, reject) => {
-                        thumbUpsertStmt.run(item.path, item.mtime, (err) => err ? reject(err) : resolve());
-                    });
+                    thumbValues.push([
+                        item.path, item.mtime, 'pending', 0
+                    ]);
                 }
+            }
+            
+            // 批量插入items表 - MariaDB语法
+            if (itemValues.length > 0) {
+                const placeholders = itemValues.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
+                const flatValues = itemValues.flat();
+                await dbRun('main', 
+                    `INSERT INTO items (name, path, type, mtime, width, height) VALUES ${placeholders} 
+                     ON DUPLICATE KEY UPDATE mtime=VALUES(mtime), width=VALUES(width), height=VALUES(height)`,
+                    flatValues
+                );
+            }
+            
+            // 批量插入缩略图状态
+            if (thumbValues.length > 0) {
+                const placeholders = thumbValues.map(() => '(?, ?, ?, ?)').join(', ');
+                const flatValues = thumbValues.flat();
+                await dbRun('main',
+                    `INSERT INTO thumb_status (path, mtime, status, last_checked) VALUES ${placeholders}
+                     ON DUPLICATE KEY UPDATE mtime=VALUES(mtime), status=VALUES(status)`,
+                    flatValues
+                );
             }
         },
 
@@ -360,7 +357,7 @@ const { invalidateTags } = require('../services/cache.service.js');
                 try { adaptDbTimeouts({ busyTimeoutDeltaMs: 20000, queryTimeoutDeltaMs: 15000 }); } catch {}
                 try { await redis.set('indexing_in_progress', '1', 'EX', 60); } catch {}
 
-                await dbRun('main', "BEGIN IMMEDIATE");
+                await dbRun('main', "START TRANSACTION");
                 
                 const addOperations = [];
                 const deletePaths = [];
@@ -375,7 +372,7 @@ const { invalidateTags } = require('../services/cache.service.js');
                         continue;
                     }
                     // 统一忽略数据库相关文件（避免误入索引管道）
-                    if (/\.(db|db3|sqlite|sqlite3|wal|shm)$/i.test(relativePath)) {
+                    if (/\.(db|db3|sql|bak|log|tmp)$/i.test(relativePath)) {
                         continue;
                     }
                     // 增加对 HLS 文件的忽略，防止索引器自我循环
@@ -415,25 +412,19 @@ const { invalidateTags } = require('../services/cache.service.js');
                 }
                 
                 if (addOperations.length > 0) {
-                    const itemsStmt = getDB('main').prepare("INSERT OR IGNORE INTO items (name, path, type, mtime, width, height) VALUES (?, ?, ?, ?, ?, ?)");
-                    const ftsStmt = getDB('main').prepare("INSERT INTO items_fts (rowid, name) VALUES (?, ?)");
-                    const thumbUpsertStmt = getDB('main').prepare("INSERT INTO thumb_status(path, mtime, status, last_checked) VALUES(?, ?, 'pending', 0) ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, status='pending'");
                     const processedAdds = await processDimensionsInParallel(addOperations, photosDir);
-                    await tasks.processBatchInTransactionOptimized(processedAdds, itemsStmt, ftsStmt, thumbUpsertStmt);
-                    try { await new Promise((resolve, reject) => itemsStmt.finalize(err => err ? reject(err) : resolve())); } catch (e) { logger.warn('Finalizing itemsStmt failed (ignored):', e.message); }
-                    try { await new Promise((resolve, reject) => ftsStmt.finalize(err => err ? reject(err) : resolve())); } catch (e) { logger.warn('Finalizing ftsStmt failed (ignored):', e.message); }
-                    try { await new Promise((resolve, reject) => thumbUpsertStmt.finalize(err => err ? reject(err) : resolve())); } catch (e) { logger.warn('Finalizing thumbUpsertStmt failed (ignored):', e.message); }
+                    await tasks.processBatchInTransactionOptimized(processedAdds);
                 }
 
                 // 基于变更的相册集，增量维护 album_covers（UPSERT）
                 await ensureAlbumCoversTable();
                 const upsertSql = `INSERT INTO album_covers (album_path, cover_path, width, height, mtime)
                                    VALUES (?, ?, ?, ?, ?)
-                                   ON CONFLICT(album_path) DO UPDATE SET
-                                     cover_path=excluded.cover_path,
-                                     width=excluded.width,
-                                     height=excluded.height,
-                                     mtime=excluded.mtime`;
+                                   ON DUPLICATE KEY UPDATE
+                                     cover_path=VALUES(cover_path),
+                                     width=VALUES(width),
+                                     height=VALUES(height),
+                                     mtime=VALUES(mtime)`;
                 const upsertRows = [];
                 const deleteAlbumPaths = [];
                 for (const albumPath of affectedAlbums) {
@@ -441,7 +432,7 @@ const { invalidateTags } = require('../services/cache.service.js');
                     const row = await dbGet('main',
                         `SELECT path, width, height, mtime
                          FROM items
-                         WHERE type IN ('photo','video') AND path LIKE ? || '/%'
+                         WHERE type IN ('photo','video') AND path LIKE CONCAT(?, '/%')
                          ORDER BY mtime DESC
                          LIMIT 1`,
                         [albumPath]
@@ -454,11 +445,11 @@ const { invalidateTags } = require('../services/cache.service.js');
                 }
                 if (upsertRows.length > 0) {
                     try {
-                        await runPreparedBatchWithRetry(runPreparedBatch, 'main', upsertSql, upsertRows, { manageTransaction: false, chunkSize: 800 }, redis);
+                        await runPreparedBatchWithRetry('main', upsertSql, upsertRows, { manageTransaction: false, chunkSize: 800 });
                     } catch (err) {
                         if (/no such table: .*album_covers/i.test(err && err.message)) {
                             await ensureAlbumCoversTable();
-                            await runPreparedBatchWithRetry(runPreparedBatch, 'main', upsertSql, upsertRows, { manageTransaction: false, chunkSize: 800 }, redis);
+                            await runPreparedBatchWithRetry('main', upsertSql, upsertRows, { manageTransaction: false, chunkSize: 800 });
                         } else {
                             throw err;
                         }
@@ -515,7 +506,7 @@ const { invalidateTags } = require('../services/cache.service.js');
                         .filter(r => r && r.width && r.height)
                         .map(r => [r.width, r.height, r.path]);
                     if (updates.length > 0) {
-                        await runPreparedBatchWithRetry(runPreparedBatch, 'main',
+                        await runPreparedBatchWithRetry('main',
                             `UPDATE items SET width = ?, height = ? WHERE path = ?`,
                             updates,
                             { chunkSize: 800 }
@@ -563,7 +554,7 @@ const { invalidateTags } = require('../services/cache.service.js');
                         }
                     }
                     if (updates.length > 0) {
-                        await runPreparedBatchWithRetry(runPreparedBatch, 'main',
+                        await runPreparedBatchWithRetry('main',
                             `UPDATE items SET mtime = ? WHERE path = ?`,
                             updates,
                             { chunkSize: 800 }
