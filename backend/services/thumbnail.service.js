@@ -21,6 +21,10 @@ const activeTasks = new Set();          // 正在处理的任务集合
 const failureCounts = new Map();        // 任务失败次数统计
 const failureTimestamps = new Map();    // 失败记录的时间戳
 
+// 进度统计计数器
+let processedCount = 0;                 // 已处理的文件总数
+const PROGRESS_LOG_INTERVAL = 100;     // 每处理100个文件显示一次进度
+
 // 内存清理配置
 const CLEANUP_INTERVAL_MS = 30 * 60 * 1000; // 30分钟清理一次
 const FAILURE_ENTRY_TTL_MS = 24 * 60 * 60 * 1000; // 失败记录保留24小时
@@ -224,7 +228,18 @@ function setupThumbnailWorkerListeners() {
                     await redis.del(failureKey).catch(err => logger.warn(`清理Redis永久失败标记时出错: ${err.message}`));
                     try { await redis.incr('metrics:thumb:skip'); } catch {}
                 } else {
-                    logger.debug(`${workerLogId} 生成完成: ${relativePath}`);
+                    // 增加处理计数
+                    processedCount++;
+                    
+                    // 只在处理完100个文件的倍数时显示进度日志
+                    if (processedCount % PROGRESS_LOG_INTERVAL === 0) {
+                        const fileSize = task.fileSize ? `${(task.fileSize / 1024).toFixed(1)}KB` : '未知大小';
+                        const processingTime = task.processingTime ? `${task.processingTime}ms` : '未知耗时';
+                        logger.info(`[THUMBNAIL-SERVICE] 缩略图处理进度: 已完成 ${processedCount} 个文件 (最新: ${relativePath}, 大小: ${fileSize}, 耗时: ${processingTime})`);
+                    } else {
+                        // 单个文件完成的详细日志改为debug级别
+                        logger.debug(`${workerLogId} 缩略图处理完成: ${relativePath}`);
+                    }
                     
                     // 通过Redis发布订阅发送SSE事件通知前端（支持跨进程通信）
                     await redis.publish('thumbnail-generated', JSON.stringify({ path: relativePath }));
@@ -358,8 +373,8 @@ function setupThumbnailWorkerListeners() {
         });
     });
     
-    logger.debug(`缩略图工作线程监听器已设置完成，共 ${thumbnailWorkers.length} 个工作线程`);
-    logger.debug(`当前空闲工作线程数量: ${idleThumbnailWorkers.length}`);
+    logger.info(`[THUMBNAIL-SERVICE] 缩略图工作线程监听器已设置完成，共 ${thumbnailWorkers.length} 个工作线程`);
+    logger.info(`[THUMBNAIL-SERVICE] 当前空闲工作线程数量: ${idleThumbnailWorkers.length}/${thumbnailWorkers.length}`);
 }
 
 /**
@@ -368,6 +383,9 @@ function setupThumbnailWorkerListeners() {
  */
 function dispatchThumbnailTask(task, context = 'ondemand') {
     if (!task || !idleThumbnailWorkers.length) {
+        if (isDevelopment && !idleThumbnailWorkers.length) {
+            logger.debug(`[THUMBNAIL-SERVICE] 无空闲工作线程可用 (总数: ${NUM_WORKERS}, 活跃: ${global.__thumbActiveCount || 0})`);
+        }
         return false;
     }
 
@@ -394,7 +412,16 @@ function dispatchThumbnailTask(task, context = 'ondemand') {
     
     // 根据调用上下文显示不同的日志
     const logPrefix = context === 'batch' ? '[批量补全]' : '[按需生成]';
-    logger.debug(`${logPrefix} 缩略图任务已派发: ${task.relativePath}`);
+    if (context === 'ondemand') {
+        // 按需生成只在开发环境或首次处理时显示详细日志
+        if (isDevelopment || processedCount < 10) {
+            logger.info(`[THUMBNAIL-SERVICE] ${logPrefix} 任务已分发给工作线程: ${task.relativePath}`);
+        } else {
+            logger.debug(`${logPrefix} 缩略图任务已派发: ${task.relativePath}`);
+        }
+    } else {
+        logger.debug(`${logPrefix} 缩略图任务已派发: ${task.relativePath}`);
+    }
     return true;
 }
 
@@ -440,11 +467,78 @@ async function ensureThumbnailExists(sourceAbsPath, sourceRelPath) {
 
         const dispatched = dispatchThumbnailTask(task);
         if (!dispatched) {
-            logger.warn(`[按需生成] 任务派发失败: ${sourceRelPath} (工作线程繁忙或重复任务)`);
+            logger.warn(`[THUMBNAIL-SERVICE] [按需生成] 任务派发失败: ${sourceRelPath} (工作线程繁忙或重复任务)`);
+        } else if (isDevelopment) {
+            logger.debug(`[THUMBNAIL-SERVICE] [按需生成] 缩略图生成请求已接受: ${sourceRelPath}`);
         }
 
         return { status: 'processing' };
     }
+}
+
+/**
+ * 带分页和重试的数据库查询函数
+ * @param {string} dbType - 数据库类型
+ * @param {string} sql - SQL查询语句
+ * @param {Array} params - 查询参数
+ * @param {number} pageSize - 分页大小，默认10000
+ * @param {number} maxRetries - 最大重试次数，默认3
+ * @returns {Promise<Array>} 查询结果
+ */
+async function queryWithPaginationAndRetry(dbType, sql, params = [], pageSize = 10000, maxRetries = 3) {
+    const { dbAll } = require('../db/multi-db');
+    let allResults = [];
+    let offset = 0;
+    let retryCount = 0;
+    
+    // 构建分页查询SQL
+    const baseSql = sql.replace(/LIMIT\s+\d+/i, ''); // 移除原有的LIMIT
+    
+    while (true) {
+        const paginatedSql = `${baseSql} LIMIT ${pageSize} OFFSET ${offset}`;
+        
+        try {
+            const results = await dbAll(dbType, paginatedSql, params);
+            
+            if (!results || results.length === 0) {
+                break; // 没有更多数据
+            }
+            
+            allResults = allResults.concat(results);
+            const currentPage = Math.floor(offset / pageSize) + 1;
+            offset += pageSize;
+            retryCount = 0; // 重置重试计数
+            
+            // 添加短暂延迟，避免数据库压力过大
+            if (results.length === pageSize) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            
+            // 第一页使用debug日志，从第二页开始使用info日志
+            if (currentPage === 1) {
+                logger.debug(`[分页查询] 已获取 ${allResults.length} 条记录 (第${currentPage}页: ${results.length}条)`);
+            } else {
+                logger.info(`[分页查询] 已获取 ${allResults.length} 条记录 (第${currentPage}页: ${results.length}条)`);
+            }
+            
+        } catch (error) {
+            const currentPage = Math.floor(offset / pageSize) + 1;
+            logger.warn(`[分页查询] 第 ${currentPage} 页查询失败: ${error.message}`);
+            
+            if (retryCount < maxRetries) {
+                retryCount++;
+                const delay = Math.pow(2, retryCount) * 1000; // 指数退避
+                logger.info(`[分页查询] 等待 ${delay}ms 后重试第 ${retryCount} 次...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            } else {
+                logger.error(`[分页查询] 达到最大重试次数，跳过当前页`);
+                break;
+            }
+        }
+    }
+    
+    return allResults;
 }
 
 /**
@@ -455,29 +549,30 @@ async function ensureThumbnailExists(sourceAbsPath, sourceRelPath) {
  */
 async function batchGenerateMissingThumbnails(limit = 1000) {
     try {
-        const { dbAll } = require('../db/multi-db');
-        
-        // 查询需要补全的缩略图
-        // 注意：不排除'processing'状态，因为可能有任务处理失败后需要重新处理
-        const missingThumbs = await dbAll('main', `
+        // 使用分页查询替代原来的大量数据一次性查询
+        const missingThumbs = await queryWithPaginationAndRetry('main', `
             SELECT path FROM thumb_status 
             WHERE status IN ('missing', 'failed', 'pending') 
             ORDER BY last_checked ASC 
-            LIMIT ?
-        `, [limit]);
+            LIMIT ${limit}
+        `);
 
         logger.debug(`[批量补全] 数据库查询结果: 找到 ${missingThumbs?.length || 0} 个需要补全的缩略图`);
         
         // 添加更详细的调试信息
         if (missingThumbs && missingThumbs.length > 0) {
-            // 查询各状态的总数，用于调试
-            const statusCounts = await dbAll('main', `
-                SELECT status, COUNT(*) as count 
-                FROM thumb_status 
-                WHERE status IN ('missing', 'failed', 'pending', 'processing') 
-                GROUP BY status
-            `);
-            logger.debug(`[批量补全] 当前状态统计: ${statusCounts.map(s => `${s.status}:${s.count}`).join(', ')}`);
+            // 使用分页查询状态统计，避免大表COUNT超时
+            try {
+                const statusCounts = await queryWithPaginationAndRetry('main', `
+                    SELECT status, COUNT(*) as count 
+                    FROM thumb_status 
+                    WHERE status IN ('missing', 'failed', 'pending', 'processing') 
+                    GROUP BY status
+                `, [], 1000, 2); // 较小的分页大小和重试次数
+                logger.debug(`[批量补全] 当前状态统计: ${statusCounts.map(s => `${s.status}:${s.count}`).join(', ')}`);
+            } catch (e) {
+                logger.warn(`[批量补全] 状态统计查询失败，跳过: ${e.message}`);
+            }
         }
         
         // 调试：显示前5个需要补全的文件
@@ -516,7 +611,7 @@ async function batchGenerateMissingThumbnails(limit = 1000) {
         // 优化：批量补全时减少预留按需工人数量（默认为0，最大并发）
         let RESERVED_ONDEMAND = Math.max(0, Math.floor(Number(process.env.THUMB_ONDEMAND_RESERVE || 0)));
         RESERVED_ONDEMAND = Math.max(0, Math.min(RESERVED_ONDEMAND, Math.max(0, NUM_WORKERS - 2))); // 确保至少留2个工人用于批量补全
-        logger.debug(`[批量补全] 预留按需工人数: ${RESERVED_ONDEMAND}/${NUM_WORKERS} (可用工人: ${idleThumbnailWorkers.length})`);
+        logger.info(`[THUMBNAIL-SERVICE] [批量补全] 预留按需工人数: ${RESERVED_ONDEMAND}/${NUM_WORKERS} (当前可用工人: ${idleThumbnailWorkers.length}/${NUM_WORKERS})`);
 
         // 智能负载控制：确保不影响按需生成和系统运行
         const cpuCount = require('os').cpus().length;
@@ -582,6 +677,12 @@ async function batchGenerateMissingThumbnails(limit = 1000) {
             const dispatched = dispatchThumbnailTask(task, 'batch');
             if (dispatched) {
                 queued++;
+                // 批量补全时，每10个任务显示一次进度
+                if (queued % 10 === 0 || queued <= 5) {
+                    logger.info(`[THUMBNAIL-SERVICE] [批量补全] 任务已分发给工作线程: ${relativePath} (第${queued}个任务)`);
+                } else {
+                    logger.debug(`[批量补全] 任务已派发: ${relativePath} (第${queued}个)`);
+                }
                 
                 // 立即更新数据库状态为processing，避免下一轮重复查询
                 // 注意：不更新last_checked，保持原有的排序逻辑
@@ -615,7 +716,7 @@ async function batchGenerateMissingThumbnails(limit = 1000) {
             }
         }
 
-        logger.debug(`[手动补全] 缩略图批量补全完成: 已排队 ${queued} 个任务，跳过 ${skipped} 个文件`);
+        logger.info(`[THUMBNAIL-SERVICE] [批量补全] 缩略图批量补全完成: 已排队 ${queued} 个任务，跳过 ${skipped} 个文件，发现缺失 ${missingThumbs.length} 个`);
         
         return {
             success: true,
@@ -631,10 +732,43 @@ async function batchGenerateMissingThumbnails(limit = 1000) {
     }
 }
 
+/**
+ * 获取缩略图工作线程状态信息
+ */
+function getThumbnailWorkerStatus() {
+    const { thumbnailWorkers } = require('./worker.manager');
+    const totalWorkers = thumbnailWorkers ? thumbnailWorkers.length : NUM_WORKERS;
+    const idleWorkers = idleThumbnailWorkers.length;
+    const activeWorkers = totalWorkers - idleWorkers;
+    const activeCount = global.__thumbActiveCount || 0;
+    
+    return {
+        totalWorkers,
+        idleWorkers,
+        activeWorkers,
+        activeTaskCount: activeCount,
+        activeTasks: activeTasks.size,
+        failureCount: failureCounts.size,
+        workerUtilization: totalWorkers > 0 ? ((activeWorkers / totalWorkers) * 100).toFixed(1) + '%' : '0%'
+    };
+}
+
+/**
+ * 打印缩略图工作线程状态（用于调试和监控）
+ */
+function logThumbnailWorkerStatus() {
+    const status = getThumbnailWorkerStatus();
+    logger.info(`[THUMBNAIL-SERVICE] Worker状态: ${status.activeWorkers}/${status.totalWorkers} 活跃, 利用率: ${status.workerUtilization}, 活跃任务: ${status.activeTaskCount}, 失败记录: ${status.failureCount}`);
+    return status;
+}
+
 // 导出缩略图服务函数
 module.exports = {
     setupThumbnailWorkerListeners,    // 设置工作线程监听器
     ensureThumbnailExists,            // 确保缩略图存在（按需生成）
     batchGenerateMissingThumbnails,   // 批量补全缺失的缩略图
     queueThumbStatusUpdate,           // 队列缩略图状态更新
+    getThumbnailWorkerStatus,         // 获取工作线程状态
+    logThumbnailWorkerStatus,         // 打印工作线程状态
+    queryWithPaginationAndRetry       // 导出分页查询函数，供其他模块使用
 };

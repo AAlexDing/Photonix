@@ -182,11 +182,76 @@ async function startServer() {
 			} catch (e) {
 				logger.warn('触发启动期回填任务失败（忽略）：', e && e.message);
 			}
+
+			// 启动时自动执行批量补全自动循环任务
+			setTimeout(async () => {
+				try {
+					logger.info('[STARTUP] 开始执行启动时批量补全自动循环...');
+					
+					// 使用 batchGenerateThumbnails 函数启动批量补全自动循环
+					const { batchGenerateThumbnails } = require('./controllers/thumbnail.controller');
+					
+					// 模拟带有循环模式的请求
+					const mockReq = {
+						body: { 
+							loop: true,  // 启用自动循环模式
+							limit: 1000  // 单批限制
+						}
+					};
+					const mockRes = {
+						json: (data) => {
+							logger.info('[STARTUP] 启动时批量补全自动循环已启动:', data.message);
+							if (data.data) {
+								logger.info('[STARTUP] 循环模式配置:', JSON.stringify(data.data));
+							}
+						},
+						status: (code) => ({
+							json: (data) => {
+								logger.warn('[STARTUP] 启动时批量补全自动循环返回错误:', data.error || data.message);
+							}
+						})
+					};
+					
+					await batchGenerateThumbnails(mockReq, mockRes);
+				} catch (error) {
+					logger.warn('[STARTUP] 启动时批量补全自动循环失败（忽略）：', error.message);
+				}
+			}, 6000); // 延迟6秒执行，确保数据库和服务都已初始化
 		} catch (dbError) {
 			logger.debug('检查索引状态失败（降噪）：', dbError && dbError.message);
 			logger.info('由于检查失败，开始构建搜索索引...');
 			buildSearchIndex();
 			watchPhotosDir();
+
+			// 即使数据库检查失败，也要执行批量补全自动循环任务
+			setTimeout(async () => {
+				try {
+					logger.info('[STARTUP] 开始执行启动时批量补全自动循环（fallback路径）...');
+					
+					const { batchGenerateThumbnails } = require('./controllers/thumbnail.controller');
+					
+					const mockReq = {
+						body: { 
+							loop: true,  // 启用自动循环模式
+							limit: 1000  // 单批限制
+						}
+					};
+					const mockRes = {
+						json: (data) => {
+							logger.info('[STARTUP] 启动时批量补全自动循环已启动（fallback路径）:', data.message);
+						},
+						status: (code) => ({
+							json: (data) => {
+								logger.warn('[STARTUP] 启动时批量补全自动循环返回错误（fallback路径）:', data.error || data.message);
+							}
+						})
+					};
+					
+					await batchGenerateThumbnails(mockReq, mockRes);
+				} catch (error) {
+					logger.warn('[STARTUP] 启动时批量补全自动循环失败（忽略）：', error.message);
+				}
+			}, 8000); // 稍晚执行，确保索引构建已开始
 		}
 
 		setTimeout(async () => {

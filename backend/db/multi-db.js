@@ -59,8 +59,18 @@ const withTimeout = (promise, ms, queryInfo) => {
     let timerId;
     return new Promise((resolve, reject) => {
         timerId = setTimeout(() => {
-            const error = new Error(`Query timed out after ${ms}ms. Query: ${queryInfo.sql}`);
+            const queryPreview = queryInfo.sql ? queryInfo.sql.substring(0, 100) + (queryInfo.sql.length > 100 ? '...' : '') : 'Unknown query';
+            const error = new Error(`Query timed out after ${ms}ms. Query: ${queryPreview}`);
             error.code = 'MARIADB_TIMEOUT';
+            error.timeout = ms;
+            error.queryInfo = queryInfo;
+            
+            // 添加性能优化建议
+            if (queryInfo.sql && queryInfo.sql.includes('ORDER BY') && !queryInfo.sql.includes('LIMIT')) {
+                error.suggestion = 'Consider adding LIMIT clause to large ORDER BY queries';
+            }
+            
+            logger.error(`[DB-TIMEOUT] 查询超时 ${ms}ms: ${queryPreview}`);
             reject(error);
         }, ms);
 
@@ -69,6 +79,11 @@ const withTimeout = (promise, ms, queryInfo) => {
             resolve(val);
         }).catch((err) => {
             clearTimeout(timerId);
+            // 增强错误信息
+            if (err.code === 'ER_LOCK_WAIT_TIMEOUT') {
+                err.suggestion = 'Database lock timeout - consider optimizing concurrent queries';
+                logger.warn(`[DB-LOCK-TIMEOUT] 数据库锁等待超时: ${queryInfo.sql ? queryInfo.sql.substring(0, 100) : 'Unknown query'}`);
+            }
             reject(err);
         });
     });

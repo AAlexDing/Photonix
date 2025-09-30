@@ -307,7 +307,35 @@ const { THUMBS_DIR, PHOTOS_DIR } = require('../config');
                 // 先清理残留的临时文件
                 await cleanupTempFiles();
                 
-                const videos = await dbAll('main', `SELECT path FROM items WHERE type = 'video'`);
+                // 使用分页查询避免大表超时
+                let videos = [];
+                let offset = 0;
+                const pageSize = 10000;
+                
+                while (true) {
+                    const batch = await dbAll('main', `
+                        SELECT path FROM items WHERE type = 'video' 
+                        LIMIT ${pageSize} OFFSET ${offset}
+                    `);
+                    
+                    if (!batch || batch.length === 0) break;
+                    
+                    videos = videos.concat(batch);
+                    offset += pageSize;
+                    const currentPage = Math.floor(offset / pageSize);
+                    
+                    if (currentPage === 1) {
+                        logger.debug(`[分页查询] 获取视频列表: 第${currentPage}页，${batch.length}条记录`);
+                    } else {
+                        logger.info(`[分页查询] 获取视频列表: 第${currentPage}页，${batch.length}条记录`);
+                    }
+                    
+                    // 添加延迟避免数据库压力
+                    if (batch.length === pageSize) {
+                        await new Promise(resolve => setTimeout(resolve, 100));
+                    }
+                }
+                
                 // 允许通过 Redis 自适应开关关闭回填
                 try {
                     const disableBackfill = await redis.get('adaptive:disable_hls_backfill');

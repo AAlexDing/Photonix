@@ -1,9 +1,10 @@
-# Photonix | 光影画廊
+# Photonix-EX | 光影画廊-增强版
 
 [![Node.js](https://img.shields.io/badge/Node.js-20+-green.svg)](https://nodejs.org/) [![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](https://www.docker.com/)
 
 一个极简、AI 驱动的智能相册，专为现代 Web 设计。它集成了 PWA、流式加载、多数据库架构和高性能缓存，旨在提供极致的浏览体验和智能的交互方式。
 
+相比原版将SQLite换为MariaDB，针对超大规模图片库(百万级)进行了优化。
 
 ## ✨ 主要特性
 

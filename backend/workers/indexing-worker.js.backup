@@ -69,134 +69,46 @@ const { invalidateTags } = require('../services/cache.service.js');
         return parents;
     }
 
-    // 从 items 表分页重建 album_covers：
-    // 优化：使用分页查询避免超时，每批处理5000条记录
-    // 思路：先取所有相册路径集合；再分页扫描所有媒体按 mtime DESC，
+    // 从 items 表一次性重建 album_covers：
+    // 思路：先取所有相册路径集合；再将所有媒体按 mtime DESC 扫描，
     // 将尚未设置封面的父相册依次设置为当前媒体。
     async function rebuildAlbumCoversFromItems() {
-        logger.info('[INDEXING-WORKER] 开始重建 album_covers（基于 items 表，分页优化）...');
+        logger.info('[INDEXING-WORKER] 开始重建 album_covers（基于 items 表）...');
         const t0 = Date.now();
         try {
             await ensureAlbumCoversTable();
 
-            // 使用分页查询相册，避免大表超时
-            let albumSet = new Set();
-            let offset = 0;
-            const pageSize = 10000;
-            
-            while (true) {
-                const albumRows = await dbAll('main', `
-                    SELECT path FROM items WHERE type='album' 
-                    LIMIT ${pageSize} OFFSET ${offset}
-                `);
-                
-                if (!albumRows || albumRows.length === 0) break;
-                
-                albumRows.forEach(r => {
-                    albumSet.add((r.path || '').replace(/\\/g, '/'));
-                });
-                
-                offset += pageSize;
-                const currentPage = Math.floor(offset / pageSize);
-                
-                if (currentPage === 1) {
-                    logger.debug(`[分页查询] 获取相册路径: 第${currentPage}页，${albumRows.length}条记录`);
-                } else {
-                    logger.info(`[分页查询] 获取相册路径: 第${currentPage}页，${albumRows.length}条记录`);
-                }
-                
-                if (albumRows.length === pageSize) {
-                    await new Promise(resolve => setTimeout(resolve, 50));
-                }
-            }
-            
+            const albumRows = await dbAll('main', `SELECT path FROM items WHERE type='album'`);
+            const albumSet = new Set(albumRows.map(r => (r.path || '').replace(/\\/g, '/')));
             if (albumSet.size === 0) {
                 logger.info('[INDEXING-WORKER] 无相册条目，跳过封面重建。');
                 return;
             }
 
-            // 首先获取媒体总数用于进度跟踪
-            const countRows = await dbAll('main', `SELECT COUNT(1) as total FROM items WHERE type IN ('photo','video')`);
-            const totalMedia = countRows && countRows[0] ? Number(countRows[0].total) : 0;
-            logger.info(`[INDEXING-WORKER] 发现 ${totalMedia} 个媒体文件，${albumSet.size} 个相册需要设置封面`);
-
+            // 读取所有媒体，按 mtime DESC 保证先赋值最新的
+            const mediaRows = await dbAll('main', `SELECT path, mtime, width, height FROM items WHERE type IN ('photo','video') ORDER BY mtime DESC`);
             const coverMap = new Map(); // album_path -> {cover_path,width,height,mtime}
-            const BATCH_SIZE = 5000; // 每批处理5000条记录
-            let mediaOffset = 0;  // 重命名避免冲突
-            let processedCount = 0;
-            let batchNumber = 1;
 
-            // 分页查询媒体文件，按 mtime DESC 保证先赋值最新的
-            while (true) {
-                const batchStart = Date.now();
-                
-                if (batchNumber === 1) {
-                    logger.debug(`[分页查询] 处理第 ${batchNumber} 批，偏移量: ${mediaOffset}, 批次大小: ${BATCH_SIZE}`);
-                } else {
-                    logger.info(`[分页查询] 处理第 ${batchNumber} 批，偏移量: ${mediaOffset}, 批次大小: ${BATCH_SIZE}`);
-                }
-                
-                const mediaRows = await dbAll('main', 
-                    `SELECT path, mtime, width, height FROM items 
-                     WHERE type IN ('photo','video') 
-                     ORDER BY mtime DESC 
-                     LIMIT ${BATCH_SIZE} OFFSET ${mediaOffset}`
-                );
-
-                if (!mediaRows || mediaRows.length === 0) {
-                    logger.info('[INDEXING-WORKER] 没有更多媒体文件，分页查询完成');
-                    break;
-                }
-
-                // 处理当前批次的媒体文件
-                let batchProcessed = 0;
-                for (const m of mediaRows) {
-                    const mediaPath = (m.path || '').replace(/\\/g, '/');
-                    const parents = enumerateParentAlbums(mediaPath);
-                    if (parents.length === 0) continue;
-                    
-                    for (const albumPath of parents) {
-                        if (!albumSet.has(albumPath)) continue;
-                        if (!coverMap.has(albumPath)) {
-                            coverMap.set(albumPath, {
-                                cover_path: mediaPath,
-                                width: Number(m.width) || 1,
-                                height: Number(m.height) || 1,
-                                mtime: Number(m.mtime) || 0,
-                            });
-                        }
+            for (const m of mediaRows) {
+                const mediaPath = (m.path || '').replace(/\\/g, '/');
+                const parents = enumerateParentAlbums(mediaPath);
+                if (parents.length === 0) continue;
+                for (const albumPath of parents) {
+                    if (!albumSet.has(albumPath)) continue;
+                    if (!coverMap.has(albumPath)) {
+                        coverMap.set(albumPath, {
+                            cover_path: mediaPath,
+                            width: Number(m.width) || 1,
+                            height: Number(m.height) || 1,
+                            mtime: Number(m.mtime) || 0,
+                        });
                     }
-                    batchProcessed++;
                 }
-
-                processedCount += batchProcessed;
-                const batchTime = ((Date.now() - batchStart) / 1000).toFixed(1);
-                const progress = totalMedia > 0 ? ((processedCount / totalMedia) * 100).toFixed(1) : '0';
-                
-                logger.info(`[INDEXING-WORKER] 第 ${batchNumber} 批完成，处理 ${batchProcessed} 条记录，用时 ${batchTime}s，总进度: ${progress}% (${processedCount}/${totalMedia})，已找到 ${coverMap.size} 个相册封面`);
-
                 // 小优化：全部相册都已被设置封面则可提前结束
-                if (coverMap.size >= albumSet.size) {
-                    logger.info('[INDEXING-WORKER] 所有相册都已找到封面，提前结束处理');
-                    break;
-                }
-
-                mediaOffset += BATCH_SIZE;  // 使用重命名后的变量
-                batchNumber++;
-
-                // 批次间短暂延迟，降低数据库压力
-                if (mediaRows.length === BATCH_SIZE) {
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                }
-            }
-
-            if (coverMap.size === 0) {
-                logger.info('[INDEXING-WORKER] 未找到任何相册封面，跳过写入');
-                return;
+                if (coverMap.size >= albumSet.size) break;
             }
 
             // 批量写入（UPSERT）— 统一使用通用 Prepared 批处理
-            logger.info(`[INDEXING-WORKER] 开始写入 ${coverMap.size} 个相册封面到数据库...`);
             const upsertSql = `INSERT INTO album_covers (album_path, cover_path, width, height, mtime)
                                VALUES (?, ?, ?, ?, ?)
                                ON DUPLICATE KEY UPDATE
@@ -214,13 +126,9 @@ const { invalidateTags } = require('../services/cache.service.js');
             await runPreparedBatchWithRetry('main', upsertSql, rows, { chunkSize: 800 });
 
             const dt = ((Date.now() - t0) / 1000).toFixed(1);
-            logger.info(`[INDEXING-WORKER] album_covers 重建完成，用时 ${dt}s，生成 ${coverMap.size} 条封面记录，处理了 ${processedCount} 个媒体文件`);
+            logger.info(`[INDEXING-WORKER] album_covers 重建完成，用时 ${dt}s，生成 ${coverMap.size} 条。`);
         } catch (e) {
             logger.error('[INDEXING-WORKER] 重建 album_covers 失败:', e);
-            // 提供更详细的错误信息
-            if (e.code === 'MARIADB_TIMEOUT') {
-                logger.error('[INDEXING-WORKER] 数据库查询超时，建议检查 MARIADB_QUERY_TIMEOUT 配置和数据库性能');
-            }
         }
     }
     
@@ -303,41 +211,10 @@ const { invalidateTags } = require('../services/cache.service.js');
     const tasks = {
         async get_all_media_items() {
             try {
-                // 使用分页查询避免大表超时
-                const pageSize = 10000;
-                let offset = 0;
-                let allItems = [];
-                
-                while (true) {
-                    const rows = await dbAll('main', `
-                        SELECT path, type FROM items 
-                        WHERE type IN ('photo','video') 
-                        LIMIT ${pageSize} OFFSET ${offset}
-                    `);
-                    
-                    if (!rows || rows.length === 0) break;
-                    
-                    const payload = rows.map(r => ({ 
-                        path: (r.path || '').replace(/\\/g, '/'), 
-                        type: r.type 
-                    }));
-                    allItems = allItems.concat(payload);
-                    offset += pageSize;
-                    const currentPage = Math.floor(offset / pageSize);
-                    
-                    if (currentPage === 1) {
-                        logger.debug(`[分页查询] 获取媒体项目: 第${currentPage}页，${rows.length}条记录`);
-                    } else {
-                        logger.info(`[分页查询] 获取媒体项目: 第${currentPage}页，${rows.length}条记录`);
-                    }
-                    
-                    // 添加短暂延迟避免数据库压力
-                    if (rows.length === pageSize) {
-                        await new Promise(resolve => setTimeout(resolve, 100));
-                    }
-                }
-                
-                parentPort.postMessage({ type: 'all_media_items_result', payload: allItems });
+                // 仅返回必要字段，降低消息体体积
+                const rows = await dbAll('main', `SELECT path, type FROM items WHERE type IN ('photo','video')`);
+                const payload = (rows || []).map(r => ({ path: (r.path || '').replace(/\\/g, '/'), type: r.type }));
+                parentPort.postMessage({ type: 'all_media_items_result', payload });
             } catch (e) {
                 logger.error('[INDEXING-WORKER] 获取全部媒体列表失败:', e && e.message);
                 parentPort.postMessage({ type: 'error', error: e && e.message ? e.message : String(e) });

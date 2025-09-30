@@ -63,7 +63,7 @@ const idleThumbnailWorkers = [];    // 空闲的缩略图工作线程队列
  * 根据配置的工作线程数量创建缩略图处理线程池
  */
 const createThumbnailWorkerPool = () => {
-    logger.info(`创建 ${NUM_WORKERS} 个缩略图处理工人...`);
+    logger.info(`[WORKER-MANAGER] 创建 ${NUM_WORKERS} 个缩略图处理工人...`);
     
     // 创建指定数量的缩略图工作线程
     for (let i = 0; i < NUM_WORKERS; i++) {
@@ -76,6 +76,8 @@ const createThumbnailWorkerPool = () => {
         thumbnailWorkers.push(worker);
         idleThumbnailWorkers.push(worker);
     }
+    
+    logger.info(`[WORKER-MANAGER] 缩略图工作线程池创建完成：${NUM_WORKERS} 个工作线程已就绪 (内存限制: ${process.env.WORKER_MEMORY_MB || 512}MB/工作线程)`);
 };
 
 // 为专用工作线程设置错误处理（在首次创建时绑定）

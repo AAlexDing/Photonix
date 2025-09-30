@@ -557,25 +557,97 @@ async function triggerSyncOperation(type) {
 }
 
 /**
+ * 带分页和重试的数据库查询函数（在settings控制器中使用）
+ */
+async function queryWithPaginationAndRetry(dbType, sql, params = [], pageSize = 10000, maxRetries = 3) {
+    const { dbAll } = require('../db/multi-db');
+    let allResults = [];
+    let offset = 0;
+    let retryCount = 0;
+    
+    const baseSql = sql.replace(/LIMIT\s+\d+/i, '');
+    
+    while (true) {
+        const paginatedSql = `${baseSql} LIMIT ${pageSize} OFFSET ${offset}`;
+        
+        try {
+            const results = await dbAll(dbType, paginatedSql, params);
+            
+            if (!results || results.length === 0) {
+                break;
+            }
+            
+            allResults = allResults.concat(results);
+            const currentPage = Math.floor(offset / pageSize) + 1;
+            offset += pageSize;
+            retryCount = 0;
+            
+            if (results.length === pageSize) {
+                await new Promise(resolve => setTimeout(resolve, 50)); // 短暂延迟
+            }
+            
+            // 第一页使用debug日志，从第二页开始使用info日志
+            if (currentPage === 1) {
+                logger.debug(`[分页查询-Settings] 已获取 ${allResults.length} 条记录 (第${currentPage}页: ${results.length}条)`);
+            } else {
+                logger.info(`[分页查询-Settings] 已获取 ${allResults.length} 条记录 (第${currentPage}页: ${results.length}条)`);
+            }
+            
+        } catch (error) {
+            const currentPage = Math.floor(offset / pageSize) + 1;
+            logger.warn(`[分页查询-Settings] 第 ${currentPage} 页查询失败: ${error.message}`);
+            
+            if (retryCount < maxRetries) {
+                retryCount++;
+                const delay = Math.pow(2, retryCount) * 500;
+                await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            } else {
+                logger.error(`[分页查询-Settings] 达到最大重试次数，跳过当前页`);
+                break;
+            }
+        }
+    }
+    
+    return allResults;
+}
+
+/**
  * 执行缩略图补全检查
  * 将状态为 missing 的文件标记为 pending，准备生成缩略图
  */
 async function performThumbnailReconcile() {
     try {
-        const { dbAll, runAsync } = require('../db/multi-db');
+        const { runAsync } = require('../db/multi-db');
         const { PHOTOS_DIR } = require('../config');
         const { promises: fsp } = require('fs');
         const path = require('path');
 
-        // 查询状态为 missing 的文件
-        const missingFiles = await dbAll('main', `
+        logger.info('[THUMBNAIL-RECONCILE] 开始缩略图补全检查...');
+
+        // 首先查看thumb_status表的整体状态
+        try {
+            const statusCounts = await queryWithPaginationAndRetry('main', `
+                SELECT status, COUNT(*) as count 
+                FROM thumb_status 
+                GROUP BY status
+            `);
+            logger.info('[THUMBNAIL-RECONCILE] thumb_status表状态统计:', statusCounts.map(s => `${s.status}:${s.count}`).join(', '));
+        } catch (e) {
+            logger.warn('[THUMBNAIL-RECONCILE] 无法获取状态统计:', e.message);
+        }
+
+        // 使用分页查询状态为 missing 或 failed 的文件，避免大表查询超时
+        const missingFiles = await queryWithPaginationAndRetry('main', `
             SELECT path FROM thumb_status 
-            WHERE status = 'missing' 
+            WHERE status IN ('missing', 'failed') 
             LIMIT 1000
         `);
 
+        logger.info(`[THUMBNAIL-RECONCILE] 找到 ${missingFiles?.length || 0} 个需要补全的文件`);
+
         if (!missingFiles || missingFiles.length === 0) {
-            logger.debug('缩略图补全检查完成：没有发现需要补全的缩略图');
+            logger.info('缩略图补全检查完成：没有发现需要补全的缩略图');
             return;
         }
 
@@ -624,12 +696,14 @@ async function performThumbnailReconcile() {
  */
 async function performHlsReconcile() {
     try {
-        const { dbAll } = require('../db/multi-db');
         const { getVideoWorker } = require('../services/worker.manager');
         const { promises: fs } = require('fs');
         const path = require('path');
         
-        const videos = await dbAll('main', `SELECT path FROM items WHERE type='video' LIMIT 1000`);
+        // 使用分页查询所有视频，避免大表查询超时
+        const videos = await queryWithPaginationAndRetry('main', `
+            SELECT path FROM items WHERE type='video' LIMIT 1000
+        `);
 
         if (!videos || videos.length === 0) {
             logger.debug('HLS补全检查：没有发现需要处理的视频文件');
@@ -759,8 +833,8 @@ async function performThumbnailCleanup() {
         const { promises: fsp } = require('fs');
         const path = require('path');
 
-        // 获取数据库中记录的所有缩略图状态
-        const allThumbs = await dbAll('main', "SELECT path, status FROM thumb_status");
+        // 获取数据库中记录的所有缩略图状态 - 使用分页查询避免超时
+        const allThumbs = await queryWithPaginationAndRetry('main', "SELECT path, status FROM thumb_status");
         let deletedCount = 0;
         let errorCount = 0;
 
@@ -818,8 +892,8 @@ async function performHlsCleanup() {
         const { promises: fsp } = require('fs');
         const path = require('path');
 
-        // 获取数据库中记录的所有视频文件
-        const allVideos = await dbAll('main', "SELECT path FROM items WHERE type='video'");
+        // 获取数据库中记录的所有视频文件 - 使用分页查询避免超时
+        const allVideos = await queryWithPaginationAndRetry('main', "SELECT path FROM items WHERE type='video'");
         const sourceVideoPaths = new Set(allVideos.map(v => v.path));
 
         const hlsDir = path.join(THUMBS_DIR, 'hls');
@@ -911,8 +985,8 @@ async function checkSyncStatus(type) {
         const path = require('path');
 
         if (type === 'thumbnail') {
-            // 检查缩略图同步状态
-            const allThumbs = await dbAll('main', "SELECT path FROM thumb_status");
+            // 检查缩略图同步状态 - 使用分页查询避免超时
+            const allThumbs = await queryWithPaginationAndRetry('main', "SELECT path FROM thumb_status");
             let redundantCount = 0;
 
             for (const thumb of allThumbs) {
@@ -928,8 +1002,8 @@ async function checkSyncStatus(type) {
             return { total, synced, redundant: redundantCount, isSynced: redundantCount === 0 };
 
         } else if (type === 'hls') {
-            // 检查HLS同步状态
-            const allVideos = await dbAll('main', "SELECT path FROM items WHERE type='video'");
+            // 检查HLS同步状态 - 使用分页查询避免超时
+            const allVideos = await queryWithPaginationAndRetry('main', "SELECT path FROM items WHERE type='video'");
             const sourceVideoPaths = new Set(allVideos.map(v => v.path));
 
             const hlsDir = path.join(THUMBS_DIR, 'hls');
@@ -1035,6 +1109,9 @@ function getTypeDisplayName(type) {
     };
     return names[type] || type;
 }
+
+// 导出 triggerSyncOperation 函数供启动时自动调用
+exports.triggerSyncOperation = triggerSyncOperation;
 
 
 
