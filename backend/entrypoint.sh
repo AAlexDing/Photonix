@@ -12,9 +12,9 @@ echo "🚀 容器启动脚本开始执行..."
 mkdir -p /app/data/thumbnails
 
 # 强制将 /app/data 目录的所有权递归地更改为 node 用户和 node 用户组。
-# 解决权限问题的核心步骤。
+# 解决权限问题的核心步骤。设置60秒超时，避免在巨大目录上长时间阻塞。
 echo "📁 正在配置数据目录权限..."
-chown -R node:node /app/data
+timeout 60 chown -R node:node /app/data || echo "⚠️ 权限配置超时或失败，继续启动..."
 
 # 先确保后端依赖就绪（自愈：若缺失则自动安装）
 if [ ! -f "/app/backend/node_modules/express/package.json" ] || [ ! -f "/app/backend/node_modules/mysql2/package.json" ] || [ ! -f "/app/backend/node_modules/bullmq/package.json" ]; then

@@ -363,7 +363,7 @@ export async function fetchBrowseResults(path, page, signal) {
         }
 
         if (signal.aborted) return null;
-        if (response.status === 401 && path !== '') {
+        if (response.status === 401) {
             const refreshed = await tryRefreshToken();
             if (refreshed) {
                 response = await fetch(`/api/browse/${encodedPath}?page=${page}&limit=50&sort=${sort}`, {

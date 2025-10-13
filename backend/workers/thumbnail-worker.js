@@ -24,7 +24,29 @@ function translateErrorMessage(message = '') {
     if (msg.includes('png') && (msg.includes('bad') || msg.includes('invalid'))) {
         return 'PNG 文件损坏或格式异常，无法解析';
     }
+    if (msg.includes('unsupported image format')) {
+        return 'Input file contains unsupported image format';
+    }
     return message || '无法解析的图片文件';
+}
+
+// 使用 ffmpeg 作为后备方案处理 sharp 无法识别的图片格式
+async function generateImageThumbnailWithFfmpeg(imagePath, thumbPath) {
+    return new Promise((resolve) => {
+        const args = [
+            '-v', 'error',
+            '-y',
+            '-i', imagePath,
+            '-vf', 'scale=500:-2',
+            '-frames:v', '1',
+            '-q:v', '3',
+            thumbPath
+        ];
+        execFile('ffmpeg', args, (err) => {
+            if (err) return resolve({ success: false, error: err.message });
+            resolve({ success: true });
+        });
+    });
 }
 
 // 增加对损坏或非标准图片文件的容错处理
@@ -51,7 +73,7 @@ async function generateImageThumbnail(imagePath, thumbPath) {
         }
 
         await sharp(imagePath, { limitInputPixels: Number(process.env.SHARP_MAX_PIXELS || (24000 * 24000)) })
-            .resize({ width: 500 })
+            .resize({ width: 500, withoutEnlargement: true })
             .webp({ quality: dynamicQuality })
             .toFile(thumbPath);
     };
@@ -66,16 +88,31 @@ async function generateImageThumbnail(imagePath, thumbPath) {
         try {
             // 使用 failOn: 'none' 模式，让 sharp 尽可能忽略错误，完成转换
             await sharp(imagePath, { failOn: 'none', limitInputPixels: Number(process.env.SHARP_MAX_PIXELS || (24000 * 24000)) })
-                .resize({ width: 500 })
+                .resize({ width: 500, withoutEnlargement: true })
                 .webp({ quality: 60 }) // 在安全模式下使用稍低的质量
                 .toFile(thumbPath);
             
             console.log(`[WORKER] 图片: ${path.basename(imagePath)} 在安全模式下处理成功。`);
             return { success: true };
         } catch (safeError) {
-            // 如果连安全模式都失败了，那这个文件确实有问题
+            // 如果连安全模式都失败了，尝试最后的后备方案
             const zhSafeReason = translateErrorMessage(safeError && safeError.message);
-            console.error(`[WORKER] 图片: ${path.basename(imagePath)} 在安全模式下处理失败: ${zhSafeReason}`);
+
+            // 如果是"不支持的格式"错误，尝试使用 ffmpeg 处理
+            if (zhSafeReason.includes('unsupported image format')) {
+                console.warn(`[WORKER] 图片: ${path.basename(imagePath)} sharp 无法处理，尝试使用 ffmpeg...`);
+                try {
+                    const ffmpegResult = await generateImageThumbnailWithFfmpeg(imagePath, thumbPath);
+                    if (ffmpegResult.success) {
+                        console.log(`[WORKER] 图片: ${path.basename(imagePath)} ffmpeg 处理成功。`);
+                        return { success: true };
+                    }
+                } catch (ffmpegError) {
+                    console.error(`[WORKER] 图片: ${path.basename(imagePath)} ffmpeg 也失败了: ${ffmpegError.message}`);
+                }
+            }
+
+            console.error(`[WORKER] 图片: ${path.basename(imagePath)} 所有处理方法均失败: ${zhSafeReason}`);
             return { success: false, error: 'PROCESSING_FAILED_IN_SAFE_MODE', message: zhSafeReason };
         }
     }
