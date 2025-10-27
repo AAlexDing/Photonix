@@ -1,1119 +1,480 @@
-const bcrypt = require('bcryptjs');
+/**
+ * @file 系统设置相关控制器 (Settings Controller)
+ * @description 负责处理与系统设置相关的所有 HTTP 接口，包括客户端设置信息获取、系统设置更新、更新状态查询、系统维护操作等。
+ */
+
 const logger = require('../config/logger');
 const settingsService = require('../services/settings.service');
-const { settingsWorker } = require('../services/worker.manager'); // 兼容保留
-const { settingsUpdateQueue } = require('../config/redis');
-const { dbAll, dbGet } = require('../db/multi-db');
-const { promises: fs } = require('fs');
-const path = require('path');
-const { THUMBS_DIR, PHOTOS_DIR } = require('../config');
+const albumManagementService = require('../services/albumManagement.service');
+const manualSyncScheduler = require('../services/manualSyncScheduler.service');
+const { hasPermission, getUserRole, PERMISSIONS } = require('../middleware/permissions');
+const { AppError, AuthorizationError, ValidationError, ConfigurationError } = require('../utils/errors');
 
-// 存储最近的设置更新状态（向后兼容，同时引入基于ID的 Map 存储）
-let lastSettingsUpdateStatus = null;
-const updateStatusMap = new Map(); // key: updateId, value: { status, message, updatedKeys, timestamp }
+/**
+ * 管理员密钥验证错误处理
+ * @param {object} result 验证返回结果对象
+ * @param {string} [defaultMessage='管理员密钥验证失败'] 默认错误提示
+ * @returns {AppError} 对应类型的错误对象
+ */
+function mapAdminSecretError(result, defaultMessage = '管理员密钥验证失败') {
+  const message = result?.msg || defaultMessage;
+  const code = result?.code || 500;
 
-// 获取设置的逻辑不变
-exports.getSettingsForClient = async (req, res) => {
-    const allSettings = await settingsService.getAllSettings();
-    const clientSettings = {
-        // 仅公开非敏感字段；AI_URL/AI_MODEL/AI_PROMPT 不对外返回
-        AI_ENABLED: allSettings.AI_ENABLED,
-        PASSWORD_ENABLED: allSettings.PASSWORD_ENABLED,
-        hasPassword: !!(allSettings.PASSWORD_HASH && allSettings.PASSWORD_HASH !== ''),
-        isAdminSecretConfigured: !!(process.env.ADMIN_SECRET && process.env.ADMIN_SECRET.trim() !== '')
-    };
-    res.json(clientSettings);
-};
-
-// 通用旧密码或管理员密钥校验函数
-async function verifyAdminSecret(adminSecret) {
-    // 首先检查服务器是否配置了ADMIN_SECRET
-    if (!process.env.ADMIN_SECRET || process.env.ADMIN_SECRET.trim() === '') {
-        logger.warn('安全操作失败：管理员密钥未在.env文件中配置。');
-        return { ok: false, code: 500, msg: '管理员密钥未在服务器端配置，无法执行此操作' };
-    }
-
-    // 然后检查用户是否提供了密钥
-    if (!adminSecret || adminSecret.trim() === '') {
-        return { ok: false, code: 400, msg: '必须提供管理员密钥' };
-    }
-
-    // 最后验证密钥是否正确
-    if (adminSecret !== process.env.ADMIN_SECRET) {
-        return { ok: false, code: 401, msg: '管理员密钥错误' };
-    }
-
-    logger.info('管理员密钥验证成功');
-    return { ok: true };
+  if (code === 400) return new ValidationError(message);
+  if (code === 401 || code === 403) return new AuthorizationError(message);
+  if (code === 500) return new ConfigurationError(message);
+  return new AppError(message, code);
 }
 
-// 更新设置的逻辑改变
-exports.updateSettings = async (req, res) => {
-        const { newPassword, adminSecret, ...rawSettings } = req.body;
-
-        // 明确禁止持久化 AI 密钥相关字段
-        const forbiddenKeys = ['AI_KEY', 'AI_API_KEY', 'OPENAI_API_KEY'];
-        const settingsToUpdate = Object.fromEntries(
-            Object.entries(rawSettings).filter(([k]) => !forbiddenKeys.includes(k))
-        );
-
-        const allSettings = await settingsService.getAllSettings();
-        const passwordIsCurrentlySet = !!(allSettings.PASSWORD_HASH && allSettings.PASSWORD_HASH !== '');
-
-        const isTryingToSetOrChangePassword = newPassword && newPassword.trim() !== '';
-        const isTryingToDisablePassword = Object.prototype.hasOwnProperty.call(settingsToUpdate, 'PASSWORD_ENABLED') && settingsToUpdate.PASSWORD_ENABLED === 'false';
-
-        // 敏感操作指的是修改或禁用一个已经存在的密码
-        const isSensitiveOperation = (isTryingToSetOrChangePassword || isTryingToDisablePassword) && passwordIsCurrentlySet;
-
-        // --- 审计辅助：构建安全的审计上下文（不写入敏感值） ---
-        function buildAuditContext(extra) {
-            const headerUserId = req.headers['x-user-id'] || req.headers['x-userid'] || req.headers['x-user'];
-            const userId = (req.user && req.user.id) ? String(req.user.id) : (headerUserId ? String(headerUserId) : 'anonymous');
-            return {
-                requestId: req.requestId || '-',
-                ip: req.ip,
-                userId,
-                ...extra
-            };
-        }
-
-        if (isSensitiveOperation) {
-            const verifyResult = await verifyAdminSecret(adminSecret);
-            if (!verifyResult.ok) {
-                // 审计：敏感操作校验失败
-                logger.warn(JSON.stringify(buildAuditContext({
-                    action: 'update_settings',
-                    sensitive: true,
-                    status: 'denied',
-                    reason: verifyResult.msg
-                })));
-                return res.status(verifyResult.code).json({ error: verifyResult.msg });
-            }
-        }
-
-        // 根据操作类型，更新密码哈希
-        if (isTryingToSetOrChangePassword) {
-            logger.info('正在为新密码生成哈希值...');
-            const salt = await bcrypt.genSalt(10);
-            settingsToUpdate.PASSWORD_HASH = await bcrypt.hash(newPassword, salt);
-        } else if (isTryingToDisablePassword && passwordIsCurrentlySet) {
-            settingsToUpdate.PASSWORD_HASH = '';
-        }
-        
-        // 开启密码访问时，若数据库无密码，必须强制要求设置新密码
-        if (
-            Object.prototype.hasOwnProperty.call(settingsToUpdate, 'PASSWORD_ENABLED') &&
-            settingsToUpdate.PASSWORD_ENABLED === 'true' &&
-            !passwordIsCurrentlySet && !isTryingToSetOrChangePassword
-        ) {
-            return res.status(400).json({ error: '请设置新密码以启用密码访问' });
-        }
-
-        // 检查是否包含认证相关设置（密码或AI配置）
-        const authRelatedKeys = ['PASSWORD_ENABLED', 'PASSWORD_HASH', 'AI_ENABLED', 'AI_URL', 'AI_API_KEY', 'AI_MODEL', 'AI_PROMPT'];
-        const hasAuthChanges = Object.keys(settingsToUpdate).some(key => authRelatedKeys.includes(key));
-
-        // 使用时间戳+随机串作为唯一ID，降低并发碰撞概率
-        const updateId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-        // 设置初始状态
-        const initialStatus = {
-            timestamp: updateId,
-            status: 'pending',
-            updatedKeys: Object.keys(settingsToUpdate)
-        };
-        lastSettingsUpdateStatus = initialStatus; // 兼容旧查询
-        updateStatusMap.set(updateId, initialStatus);
-        
-        // 首选：投递到 BullMQ 队列（持久化、可重试）
-        try {
-            await settingsUpdateQueue.add('update_settings', { settingsToUpdate, updateId });
-            logger.info('设置更新任务已投递到队列');
-        } catch (e) {
-            logger.warn('投递到设置队列失败，降级使用线程消息：', e && e.message);
-            try { settingsWorker.postMessage({ type: 'update_settings', payload: { settingsToUpdate, updateId } }); } catch {}
-        }
-
-        if (hasAuthChanges) {
-            // 对于认证相关设置，异步处理，立即返回202 Accepted
-            logger.info('检测到认证相关设置变更，任务已提交到后台处理...');
-
-            // 审计：敏感相关变更已提交
-            logger.info(JSON.stringify(buildAuditContext({
-                action: 'update_settings',
-                sensitive: true,
-                status: 'submitted',
-                updatedKeys: Object.keys(settingsToUpdate)
-            })));
-
-            // 立即返回202，告知客户端任务已接受，并提供查询ID
-            return res.status(202).json({ 
-                success: true, 
-                message: '设置更新任务已接受，正在后台处理',
-                status: 'pending',
-                updateId
-            });
-        } else {
-            // 对于非认证相关设置，立即返回成功
-            logger.info('非认证相关设置变更，立即返回成功');
-
-            // 审计：非敏感设置已提交
-            logger.info(JSON.stringify(buildAuditContext({
-                action: 'update_settings',
-                sensitive: false,
-                status: 'submitted',
-                updatedKeys: Object.keys(settingsToUpdate)
-            })));
-
-            res.json({ 
-                success: true, 
-                message: '配置更新任务已提交',
-                status: 'submitted',
-                updateId
-            });
-        }
-};
-
-// 新增：获取设置更新状态
-exports.getSettingsUpdateStatus = async (req, res) => {
-    const id = req.query?.id || req.body?.id;
-    if (id && updateStatusMap.has(id)) {
-        const st = updateStatusMap.get(id);
-        if (st.status === 'pending' && Date.now() - (Number(st.timestamp.split('-')[0]) || Date.now()) > 30000) {
-            st.status = 'timeout';
-        }
-        // 优先读取 worker 写入的 Redis 状态以获得最终态
-        try {
-            const { redis } = require('../config/redis');
-            const raw = await redis.get(`settings_update_status:${id}`);
-            if (raw) {
-                const parsed = JSON.parse(raw);
-                return res.json({ status: parsed.status, timestamp: st.timestamp, updatedKeys: parsed.updatedKeys || st.updatedKeys, message: parsed.message || null });
-            }
-        } catch {}
-        return res.json({ status: st.status, timestamp: st.timestamp, updatedKeys: st.updatedKeys, message: st.message || null });
-    }
-    if (lastSettingsUpdateStatus) {
-        const st = lastSettingsUpdateStatus;
-        if (st.status === 'pending' && Date.now() - (Number(String(st.timestamp).split('-')[0]) || Date.now()) > 30000) {
-            st.status = 'timeout';
-        }
-        return res.json({ status: st.status, timestamp: st.timestamp, updatedKeys: st.updatedKeys, message: st.message || null });
-    }
-    return res.status(404).json({ error: '没有找到最近的设置更新记录' });
-};
-
-// 导出函数供 indexer.service.js 调用
-exports.updateSettingsStatus = (status, message = null, updateId = null) => {
-    if (updateId && updateStatusMap.has(updateId)) {
-        const st = updateStatusMap.get(updateId);
-        st.status = status;
-        st.message = message;
-        lastSettingsUpdateStatus = st; // 顺带刷新最后一次
-    } else if (lastSettingsUpdateStatus) {
-        lastSettingsUpdateStatus.status = status;
-        lastSettingsUpdateStatus.message = message;
-    }
-};
-
 /**
- * 获取状态表信息
+ * 自动维护计划更新错误处理
+ * @param {Error} error 原始错误对象
+ * @returns {AppError} 自定义错误对象
  */
-exports.getStatusTables = async (req, res) => {
-    try {
-        const statusTables = {
-            index: await getIndexStatus(),
-            thumbnail: await getThumbnailStatus(),
-            hls: await getHlsStatus()
-        };
+function mapScheduleUpdateError(error) {
+  if (error instanceof AppError) return error;
+  const message = error?.message || '更新自动维护计划失败';
 
-        res.json({
-            success: true,
-            data: statusTables,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        logger.error('获取状态表信息失败:', error);
-        res.status(500).json({
-            success: false,
-            error: '获取状态表信息失败',
-            message: error.message
-        });
-    }
+  // 转译典型计划格式错误为验证类异常
+  if (/Cron|分钟|计划|字段|间隔|整数|范围|表达式/.test(message)) {
+    return new ValidationError(message);
+  }
+  return new AppError(message, 500);
+}
+
+// 设置更新相关服务
+const {
+  generateUniqueId,
+  validateAndFilterSettings,
+  handlePasswordOperations,
+  detectAuthChanges,
+  buildAuditContext,
+  verifySensitiveOperations,
+  dispatchUpdateTask,
+  buildUpdateResponse
+} = require('../services/settings/update.service');
+
+// 设置更新状态相关服务
+const {
+  seedUpdateStatus,
+  applyStatusUpdate,
+  resolveUpdateStatus
+} = require('../services/settings/status.service');
+
+// 系统维护/同步相关服务
+const {
+  thumbnailSyncService,
+  getIndexStatus,
+  getHlsStatus,
+  triggerSyncOperation,
+  triggerCleanupOperation,
+  getTypeDisplayName
+} = require('../services/settings/maintenance.service');
+
+/**
+ * 获取客户端设置信息
+ * @function getSettingsForClient
+ * @description 提供前端所需的基础设置信息，如各项功能启用及安全配置状态
+ * @param {Express.Request} _req
+ * @param {Express.Response} res
+ * @returns {void}
+ */
+exports.getSettingsForClient = async (_req, res) => {
+  const allSettings = await settingsService.getAllSettings();
+  res.json({
+    AI_ENABLED: allSettings.AI_ENABLED,
+    PASSWORD_ENABLED: allSettings.PASSWORD_ENABLED,
+    hasPassword: Boolean(allSettings.PASSWORD_HASH && allSettings.PASSWORD_HASH !== ''),
+    isAdminSecretConfigured: Boolean(process.env.ADMIN_SECRET && process.env.ADMIN_SECRET.trim() !== ''),
+    albumDeletionEnabled: allSettings.ALBUM_DELETE_ENABLED === 'true',
+    manualSyncSchedule: allSettings.MANUAL_SYNC_SCHEDULE || 'off',
+    manualSyncStatus: manualSyncScheduler.getStatus()
+  });
 };
 
 /**
- * 触发补全操作
- * 查找并补全缺失的缩略图、索引或HLS文件
+ * 更新系统设置
+ * @function updateSettings
+ * @description 包括参数校验、密码处理、敏感操作校验及异步分发任务等
+ * @param {Express.Request} req
+ * @param {Express.Response} res
+ * @returns {Promise<void>}
+ */
+exports.updateSettings = async (req, res) => {
+  try {
+    const { newPassword, adminSecret, settingsToUpdate } = validateAndFilterSettings(req.body);
+    const allSettings = await settingsService.getAllSettings();
+    const passwordOps = await handlePasswordOperations(settingsToUpdate, newPassword, allSettings);
+    const auditContextBuilder = (extra) => buildAuditContext(req, extra);
+
+    // 敏感操作验证（如密码变更等需密钥）
+    const verifyResult = await verifySensitiveOperations(passwordOps.isSensitiveOperation, adminSecret, auditContextBuilder);
+    if (!verifyResult.ok) {
+      throw mapAdminSecretError(verifyResult);
+    }
+
+    // 若启用密码访问但未设置密码，则阻止操作
+    if (
+      Object.prototype.hasOwnProperty.call(settingsToUpdate, 'PASSWORD_ENABLED') &&
+      settingsToUpdate.PASSWORD_ENABLED === 'true' &&
+      !passwordOps.passwordIsCurrentlySet &&
+      !passwordOps.isTryingToSetOrChangePassword
+    ) {
+      throw new ValidationError('请设置新密码以启用密码访问');
+    }
+
+    const hasAuthChanges = detectAuthChanges(settingsToUpdate);
+    const updateId = generateUniqueId();
+    seedUpdateStatus(updateId, Object.keys(settingsToUpdate));
+
+    const dispatchResult = await dispatchUpdateTask(settingsToUpdate, updateId, hasAuthChanges, auditContextBuilder);
+    const response = buildUpdateResponse(dispatchResult, hasAuthChanges, settingsToUpdate, auditContextBuilder);
+
+    return res.status(response.statusCode).json(response.body);
+  } catch (error) {
+    logger.error('设置更新过程中发生未预期的错误:', error);
+    throw error;
+  }
+};
+
+/**
+ * 获取设置更新状态
+ * @function getSettingsUpdateStatus
+ * @description 查询指定ID的设置更新进度或结果，兼容多种参数名
+ * @param {Express.Request} req
+ * @param {Express.Response} res
+ * @returns {Promise<void>}
+ */
+exports.getSettingsUpdateStatus = async (req, res) => {
+  // 支持 query/body, id/updateId 形式
+  const id = req.query?.id || req.query?.updateId || req.body?.id || req.body?.updateId;
+  const result = await resolveUpdateStatus(id);
+  return res.status(result.statusCode).json(result.body);
+};
+
+/**
+ * 设置更新状态内部变更（通常由服务间调用）
+ * @function updateSettingsStatus
+ * @param {string} status 状态（pending|success|failed|timeout）
+ * @param {string} [message] 可选说明
+ * @param {string} [updateId] 更新ID（可选）
+ * @returns {void}
+ */
+exports.updateSettingsStatus = (status, message = null, updateId = null) => {
+  applyStatusUpdate(updateId, status, message);
+};
+
+/**
+ * 获取内部各处理任务状态表
+ * @function getStatusTables
+ * @description 包括索引状态、缩略图处理状态、HLS转码状态等
+ * @param {Express.Request} _req
+ * @param {Express.Response} res
+ * @returns {Promise<void>}
+ */
+exports.getStatusTables = async (_req, res) => {
+  try {
+    const statusTables = {
+      index: await getIndexStatus(),
+      thumbnail: await thumbnailSyncService.getThumbnailStatus(),
+      hls: await getHlsStatus()
+    };
+    res.json({
+      success: true,
+      data: statusTables,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error('获取状态表信息失败:', error);
+    throw new AppError(error?.message || '获取状态表信息失败', 500, 'STATUS_TABLE_FETCH_FAILED', {
+      originalError: error?.message
+    });
+  }
+};
+
+/**
+ * 手动触发数据补全任务
+ * @function triggerSync
+ * @description 补全索引、缩略图、HLS、或全部（需校验权限及密钥）
+ * @param {Express.Request} req
+ * @param {Express.Response} res
+ * @returns {Promise<void>}
  */
 exports.triggerSync = async (req, res) => {
-    try {
-        const { type } = req.params;
-        const validTypes = ['index', 'thumbnail', 'hls', 'all'];
-
-        if (!validTypes.includes(type)) {
-            return res.status(400).json({
-                success: false,
-                error: '无效的补全类型',
-                validTypes
-            });
-        }
-
-        // 启动补全任务
-        const syncResult = await triggerSyncOperation(type);
-
-        res.json({
-            success: true,
-            message: `已启动${getTypeDisplayName(type)}补全任务`,
-            data: syncResult,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        logger.error(`触发${req.params.type}补全失败:`, error);
-        res.status(500).json({
-            success: false,
-            error: '补全操作失败',
-            message: error.message
-        });
+  try {
+    const { type } = req.params;
+    const validTypes = ['index', 'thumbnail', 'hls', 'all'];
+    if (!validTypes.includes(type)) {
+      throw new ValidationError('无效的补全类型', { validTypes });
     }
+    // 索引重建需鉴权与密钥检验
+    if (type === 'index') {
+      const hasPermissionToRun = hasPermission(getUserRole(req), PERMISSIONS.GENERATE_THUMBNAILS);
+      if (!hasPermissionToRun) {
+        throw new AuthorizationError('需要先设置访问密码才能重建索引');
+      }
+      const adminSecret = req.headers['x-admin-secret'] || req.body?.adminSecret;
+      const buildCtx = (extra) => ({
+        requestId: req.requestId || '-',
+        userId: (req.user && req.user.id) ? String(req.user.id) : 'anonymous',
+        action: 'trigger_sync',
+        type: 'index',
+        sensitive: true,
+        ...extra
+      });
+      const verifyResult = await verifySensitiveOperations(true, adminSecret, buildCtx);
+      if (!verifyResult.ok) {
+        throw mapAdminSecretError(verifyResult, '重建索引验证失败');
+      }
+      logger.info(JSON.stringify(buildCtx({ status: 'approved', message: '重建索引管理员密钥验证成功' })));
+    }
+    const syncResult = await triggerSyncOperation(type);
+    res.json({
+      success: true,
+      message: `已启动${getTypeDisplayName(type)}补全任务`,
+      data: syncResult,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error(`触发${req.params.type}补全失败:`, error);
+    if (error instanceof AppError) throw error;
+    throw new AppError(error?.message || '补全操作失败', 500, 'SYNC_OPERATION_FAILED', {
+      originalError: error?.message,
+      type: req.params.type
+    });
+  }
 };
 
 /**
- * 获取索引状态
+ * 手动重同步缩略图状态
+ * @function resyncThumbnails
+ * @description 全量扫描与修复缩略图状态，解决缩略图表与实际文件不一致
+ * @param {Express.Request} _req
+ * @param {Express.Response} res
+ * @returns {Promise<void>}
  */
-async function getIndexStatus() {
-    try {
-        // 获取索引状态
-        const statusRow = await dbGet('index', "SELECT status, processed_files, total_files, last_updated FROM index_status WHERE id = 1");
-
-        // 获取items表统计信息
-        const itemsStats = await dbAll('main', "SELECT type, COUNT(*) as count FROM items GROUP BY type");
-
-        return {
-            status: statusRow?.status || 'unknown',
-            processedFiles: statusRow?.processed_files || 0,
-            totalFiles: statusRow?.total_files || 0,
-            lastUpdated: statusRow?.last_updated || null,
-            itemsStats: itemsStats || []
-        };
-    } catch (error) {
-        logger.warn('获取索引状态失败:', error);
-        return {
-            status: 'error',
-            error: error.message,
-            processedFiles: 0,
-            totalFiles: 0,
-            itemsStats: []
-        };
-    }
-}
-
-/**
- * 重新同步缩略图状态
- * 简化版：直接使用数据库中的文件记录来同步状态
- */
-async function resyncThumbnailStatus() {
-    try {
-        const { promises: fs } = require('fs');
-        const { THUMBS_DIR } = require('../config');
-        const path = require('path');
-        const { dbRun, dbAll } = require('../db/multi-db');
-
-        logger.debug('开始重新同步缩略图状态...');
-
-        // 获取所有媒体文件（从items表，这个表已经被索引服务维护）
-        const mediaFiles = await dbAll('main', `
-            SELECT path, type FROM items 
-            WHERE type IN ('photo', 'video')
-        `);
-
-        if (!mediaFiles || mediaFiles.length === 0) {
-            logger.info('没有找到媒体文件，跳过同步');
-            return 0;
-        }
-
-        // 清空并重建thumb_status表
-        await dbRun('main', 'DELETE FROM thumb_status');
-        
-        let syncedCount = 0;
-        let existsCount = 0;
-        let missingCount = 0;
-
-        // 批量处理文件
-        for (const file of mediaFiles) {
-            try {
-                // 确定缩略图路径
-                const thumbExt = file.type === 'video' ? '.jpg' : '.webp';
-                const thumbPath = file.path.replace(/\.[^.]+$/, thumbExt);
-                const thumbFullPath = path.join(THUMBS_DIR, thumbPath);
-                
-                // 检查缩略图是否存在
-                let status = 'missing';
-                try {
-                    await fs.access(thumbFullPath);
-                    status = 'exists';
-                    existsCount++;
-                } catch {
-                    missingCount++;
-                }
-
-                // 插入到数据库
-                await dbRun('main', `
-                    INSERT INTO thumb_status (path, mtime, status, last_checked)
-                    VALUES (?, 0, ?, UNIX_TIMESTAMP()*1000)
-                    ON DUPLICATE KEY UPDATE status = VALUES(status), last_checked = VALUES(last_checked)
-                `, [file.path, status]);
-
-                syncedCount++;
-            } catch (error) {
-                logger.debug(`处理文件失败 ${file.path}: ${error.message}`);
-            }
-        }
-
-        logger.debug(`缩略图状态重同步完成: 总计=${syncedCount}, 存在=${existsCount}, 缺失=${missingCount}`);
-        
-        // 清理相关缓存，确保状态更新立即生效
-        try {
-            const { redis } = require('../config/redis');
-            if (redis) {
-                await redis.del('thumb_stats_cache');
-                logger.debug('已清理缩略图状态缓存');
-            }
-        } catch (cacheError) {
-            logger.debug('清理缓存失败（非关键错误）:', cacheError.message);
-        }
-        
-        return syncedCount;
-    } catch (error) {
-        logger.error('缩略图状态重同步失败:', error);
-        throw error;
-    }
-}
-
-/**
- * 获取缩略图状态
- * 简化版：直接从数据库获取状态，不进行复杂的文件系统检查
- */
-async function getThumbnailStatus() {
-    try {
-        // 获取源媒体文件总数
-        const sourceTotal = await dbAll('main', "SELECT COUNT(*) as count FROM items WHERE type IN ('photo', 'video')");
-        const sourceCount = sourceTotal?.[0]?.count || 0;
-
-        // 获取缩略图状态统计
-        const stats = await dbAll('main', `
-            SELECT status, COUNT(*) as count 
-            FROM thumb_status 
-            GROUP BY status
-        `);
-
-        // 获取缩略图表总计数
-        const total = await dbAll('main', "SELECT COUNT(*) as count FROM thumb_status");
-        const thumbStatusCount = total?.[0]?.count || 0;
-
-        // 如果数据库为空，建议用户手动重同步
-        if (thumbStatusCount === 0 && sourceCount > 0) {
-            return {
-                total: 0,
-                sourceTotal: sourceCount,
-                stats: [{ status: 'unknown', count: sourceCount }],
-                needsResync: true,
-                lastSync: null
-            };
-        }
-
-        return {
-            total: thumbStatusCount,
-            sourceTotal: sourceCount,
-            stats: stats || [],
-            lastSync: new Date().toISOString()
-        };
-    } catch (error) {
-        logger.error('获取缩略图状态失败:', error);
-        return {
-            total: 0,
-            sourceTotal: 0,
-            stats: [],
-            error: error.message,
-            lastSync: new Date().toISOString()
-        };
-    }
-}
-
-/**
- * 获取HLS状态
- */
-async function getHlsStatus() {
-    try {
-        // 获取HLS文件统计
-        const hlsStats = await getHlsFileStats();
-
-        // 获取视频文件统计
-        const videoStats = await dbAll('main', "SELECT COUNT(*) as count FROM items WHERE type='video'");
-
-        // 计算HLS处理状态
-        const totalVideos = videoStats?.[0]?.count || 0;
-        const processedVideos = hlsStats.processed || 0;
-        let status = 'unknown';
-
-        if (totalVideos === 0) {
-            status = 'no-videos'; // 没有视频文件
-        } else if (processedVideos === 0) {
-            status = 'pending'; // 有视频但未处理
-        } else if (processedVideos < totalVideos) {
-            status = 'processing'; // 处理中
-        } else if (processedVideos === totalVideos) {
-            status = 'complete'; // 已完成
-        }
-
-        return {
-            status: status,
-            totalVideos: totalVideos,
-            hlsFiles: hlsStats.total,
-            processedVideos: processedVideos,
-            lastSync: new Date().toISOString()
-        };
-    } catch (error) {
-        logger.warn('获取HLS状态失败:', error);
-        return {
-            status: 'error',
-            totalVideos: 0,
-            hlsFiles: 0,
-            processedVideos: 0,
-            error: error.message
-        };
-    }
-}
-
-/**
- * 获取HLS文件统计
- */
-async function getHlsFileStats() {
-    try {
-        const hlsDir = path.join(THUMBS_DIR, 'hls');
-        let total = 0;
-        let processed = 0;
-
-        async function scanDir(dir) {
-            try {
-                const entries = await fs.readdir(dir, { withFileTypes: true });
-                for (const entry of entries) {
-                    const fullPath = path.join(dir, entry.name);
-                    if (entry.isDirectory()) {
-                        await scanDir(fullPath);
-                    } else if (entry.name === 'master.m3u8') {
-                        total++;
-                        processed++;
-                    }
-                }
-            } catch (error) {
-                // 忽略错误，继续扫描
-            }
-        }
-
-        await scanDir(hlsDir);
-        return { total, processed };
-    } catch (error) {
-        return { total: 0, processed: 0 };
-    }
-}
-
-/**
- * 触发补全操作
- * 根据类型补全缺失的内容
- */
-async function triggerSyncOperation(type) {
-    const { getIndexingWorker } = require('../services/worker.manager');
-
-    switch (type) {
-        case 'index':
-            // 补全搜索索引（重建缺失的索引）
-            const worker = getIndexingWorker();
-            worker.postMessage({ type: 'rebuild_index', payload: { photosDir: PHOTOS_DIR } });
-            return { message: '已启动索引补全任务' };
-
-        case 'thumbnail':
-            // 补全缺失的缩略图
-            await performThumbnailReconcile();
-            return { message: '已启动缩略图补全任务' };
-
-        case 'hls':
-            // 补全缺失的HLS文件
-            await performHlsReconcile();
-            return { message: '已启动HLS补全任务' };
-
-        case 'all':
-            // 执行所有补全操作
-            const indexingWorker = getIndexingWorker();
-            indexingWorker.postMessage({ type: 'rebuild_index', payload: { photosDir: PHOTOS_DIR } });
-            await performThumbnailReconcile();
-            await performHlsReconcile();
-            return { message: '已启动全量补全任务' };
-
-        default:
-            throw new Error('未知的补全类型');
-    }
-}
-
-/**
- * 带分页和重试的数据库查询函数（在settings控制器中使用）
- */
-async function queryWithPaginationAndRetry(dbType, sql, params = [], pageSize = 10000, maxRetries = 3) {
-    const { dbAll } = require('../db/multi-db');
-    let allResults = [];
-    let offset = 0;
-    let retryCount = 0;
-    
-    const baseSql = sql.replace(/LIMIT\s+\d+/i, '');
-    
-    while (true) {
-        const paginatedSql = `${baseSql} LIMIT ${pageSize} OFFSET ${offset}`;
-        
-        try {
-            const results = await dbAll(dbType, paginatedSql, params);
-            
-            if (!results || results.length === 0) {
-                break;
-            }
-            
-            allResults = allResults.concat(results);
-            const currentPage = Math.floor(offset / pageSize) + 1;
-            offset += pageSize;
-            retryCount = 0;
-            
-            if (results.length === pageSize) {
-                await new Promise(resolve => setTimeout(resolve, 50)); // 短暂延迟
-            }
-            
-            // 第一页使用debug日志，从第二页开始使用info日志
-            if (currentPage === 1) {
-                logger.debug(`[分页查询-Settings] 已获取 ${allResults.length} 条记录 (第${currentPage}页: ${results.length}条)`);
-            } else {
-                logger.info(`[分页查询-Settings] 已获取 ${allResults.length} 条记录 (第${currentPage}页: ${results.length}条)`);
-            }
-            
-        } catch (error) {
-            const currentPage = Math.floor(offset / pageSize) + 1;
-            logger.warn(`[分页查询-Settings] 第 ${currentPage} 页查询失败: ${error.message}`);
-            
-            if (retryCount < maxRetries) {
-                retryCount++;
-                const delay = Math.pow(2, retryCount) * 500;
-                await new Promise(resolve => setTimeout(resolve, delay));
-                continue;
-            } else {
-                logger.error(`[分页查询-Settings] 达到最大重试次数，跳过当前页`);
-                break;
-            }
-        }
-    }
-    
-    return allResults;
-}
-
-/**
- * 执行缩略图补全检查
- * 将状态为 missing 的文件标记为 pending，准备生成缩略图
- */
-async function performThumbnailReconcile() {
-    try {
-        const { runAsync } = require('../db/multi-db');
-        const { PHOTOS_DIR } = require('../config');
-        const { promises: fsp } = require('fs');
-        const path = require('path');
-
-        logger.info('[THUMBNAIL-RECONCILE] 开始缩略图补全检查...');
-
-        // 首先查看thumb_status表的整体状态
-        try {
-            const statusCounts = await queryWithPaginationAndRetry('main', `
-                SELECT status, COUNT(*) as count 
-                FROM thumb_status 
-                GROUP BY status
-            `);
-            logger.info('[THUMBNAIL-RECONCILE] thumb_status表状态统计:', statusCounts.map(s => `${s.status}:${s.count}`).join(', '));
-        } catch (e) {
-            logger.warn('[THUMBNAIL-RECONCILE] 无法获取状态统计:', e.message);
-        }
-
-        // 使用分页查询状态为 missing 或 failed 的文件，避免大表查询超时
-        const missingFiles = await queryWithPaginationAndRetry('main', `
-            SELECT path FROM thumb_status 
-            WHERE status IN ('missing', 'failed') 
-            LIMIT 1000
-        `);
-
-        logger.info(`[THUMBNAIL-RECONCILE] 找到 ${missingFiles?.length || 0} 个需要补全的文件`);
-
-        if (!missingFiles || missingFiles.length === 0) {
-            logger.info('缩略图补全检查完成：没有发现需要补全的缩略图');
-            return;
-        }
-
-        let changed = 0;
-        let skipped = 0;
-
-        for (const row of missingFiles) {
-            try {
-                // 检查源文件是否存在
-                const sourceAbsPath = path.join(PHOTOS_DIR, row.path);
-                await fsp.access(sourceAbsPath);
-                
-                // 源文件存在，将状态更新为 pending
-                await runAsync('main', `
-                    UPDATE thumb_status 
-                    SET status = 'pending', last_checked = UNIX_TIMESTAMP()*1000 
-                    WHERE path = ?
-                `, [row.path]);
-                
-                changed++;
-            } catch {
-                // 源文件不存在，跳过
-                skipped++;
-            }
-        }
-
-        logger.debug(`缩略图补全检查完成：发现 ${changed} 个文件需要补全缩略图，跳过 ${skipped} 个源文件不存在的记录`);
-
-        // 追加：立即启动批量补全派发，让生成立刻开始
-        try {
-            const { batchGenerateMissingThumbnails } = require('../services/thumbnail.service');
-            const result = await batchGenerateMissingThumbnails(1000);
-            logger.debug(`[缩略图补全派发] 已启动: queued=${result.queued}, skipped=${result.skipped}, processed=${result.processed}`);
-        } catch (dispatchErr) {
-            logger.warn(`[缩略图补全派发] 启动失败（不影响状态更新）：${dispatchErr && dispatchErr.message}`);
-        }
-    } catch (error) {
-        logger.error('缩略图补全检查失败:', error);
-        throw error;
-    }
-}
-
-/**
- * 执行HLS补全检查
- * 检查哪些视频缺少HLS文件，并直接发送到视频工作线程处理
- */
-async function performHlsReconcile() {
-    try {
-        const { getVideoWorker } = require('../services/worker.manager');
-        const { promises: fs } = require('fs');
-        const path = require('path');
-        
-        // 使用分页查询所有视频，避免大表查询超时
-        const videos = await queryWithPaginationAndRetry('main', `
-            SELECT path FROM items WHERE type='video' LIMIT 1000
-        `);
-
-        if (!videos || videos.length === 0) {
-            logger.debug('HLS补全检查：没有发现需要处理的视频文件');
-            return;
-        }
-
-        const videoWorker = getVideoWorker();
-        let queued = 0;
-        let skip = 0;
-
-        for (const v of videos) {
-            try {
-                const master = path.join(THUMBS_DIR, 'hls', v.path, 'master.m3u8');
-                try {
-                    await fs.access(master);
-                    skip++; // 已存在，跳过
-                    continue;
-                } catch {
-                    // 文件不存在，需要补全HLS
-                    const sourceAbsPath = path.join(PHOTOS_DIR, v.path);
-                    
-                    // 检查源文件是否存在
-                    try {
-                        await fs.access(sourceAbsPath);
-                        
-                        // 发送HLS处理任务到视频工作线程
-                        videoWorker.postMessage({
-                            filePath: sourceAbsPath,
-                            relativePath: v.path,
-                            thumbsDir: THUMBS_DIR
-                        });
-                        
-                        queued++;
-                        
-                        // 避免一次性派发过多任务
-                        if (queued % 5 === 0) {
-                            await new Promise(resolve => setTimeout(resolve, 200));
-                        }
-                    } catch {
-                        // 源文件不存在，跳过
-                        continue;
-                    }
-                }
-            } catch (e) {
-                // 静默失败，继续处理其他视频
-                logger.debug(`HLS补全检查视频失败: ${v.path}, ${e.message}`);
-            }
-        }
-
-        logger.debug(`HLS补全检查完成：已排队 ${queued} 个视频，跳过 ${skip} 个已存在`);
-    } catch (error) {
-        logger.error('HLS补全检查失败:', error);
-        throw error;
-    }
-}
-
-/**
- * 重新同步缩略图状态
- * 手动触发缩略图状态重新同步
- */
-exports.resyncThumbnails = async (req, res) => {
-    try {
-        console.log('Manual thumbnail resync requested');
-
-        const syncedCount = await resyncThumbnailStatus();
-
-        res.json({
-            success: true,
-            message: `缩略图状态重同步完成，共同步 ${syncedCount} 个文件`,
-            data: { syncedCount },
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        console.error('Manual thumbnail resync failed:', error);
-        res.status(500).json({
-            success: false,
-            error: '缩略图状态重同步失败',
-            message: error.message
-        });
-    }
+exports.resyncThumbnails = async (_req, res) => {
+  try {
+    logger.info('手动触发缩略图状态重同步请求');
+    const result = await thumbnailSyncService.resyncThumbnailStatus({ trigger: 'manual-api', waitForCompletion: true });
+    const syncedCount = Number(result?.syncedCount || 0);
+    res.json({
+      success: true,
+      message: `缩略图状态重同步完成，共同步 ${syncedCount} 个文件`,
+      data: { syncedCount, details: result },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error('手动触发缩略图状态重同步请求失败:', error);
+    if (error instanceof AppError) throw error;
+    throw new AppError(error?.message || '缩略图状态重同步失败', 500, 'THUMBNAIL_RESYNC_FAILED', {
+      originalError: error?.message
+    });
+  }
 };
 
 /**
- * 触发同步操作（删除冗余文件）
- * 删除那些源文件不存在但缩略图/HLS文件还存在的冗余文件
+ * 触发冗余文件的清理任务
+ * @function triggerCleanup
+ * @description 包括缩略图/HLS/全量清理（根据类型参数）
+ * @param {Express.Request} req
+ * @param {Express.Response} res
+ * @returns {Promise<void>}
  */
 exports.triggerCleanup = async (req, res) => {
-    try {
-        const { type } = req.params;
-        const validTypes = ['thumbnail', 'hls', 'all'];
-
-        if (!validTypes.includes(type)) {
-            return res.status(400).json({
-                success: false,
-                error: '无效的同步类型',
-                validTypes
-            });
-        }
-
-        // 启动同步任务
-        const cleanupResult = await triggerCleanupOperation(type);
-
-        res.json({
-            success: true,
-            message: `已启动${getTypeDisplayName(type)}同步任务`,
-            data: cleanupResult,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        logger.error(`触发${req.params.type}同步失败:`, error);
-        res.status(500).json({
-            success: false,
-            error: '同步操作失败',
-            message: error.message
-        });
+  try {
+    const { type } = req.params;
+    const validTypes = ['thumbnail', 'hls', 'all'];
+    if (!validTypes.includes(type)) {
+      throw new ValidationError('无效的同步类型', { validTypes });
     }
+    const cleanupResult = await triggerCleanupOperation(type);
+    res.json({
+      success: true,
+      message: `已启动${getTypeDisplayName(type)}同步任务`,
+      data: cleanupResult,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error(`触发${req.params.type}同步失败:`, error);
+    if (error instanceof AppError) throw error;
+    throw new AppError(error?.message || '同步操作失败', 500, 'CLEANUP_OPERATION_FAILED', {
+      originalError: error?.message,
+      type: req.params.type
+    });
+  }
 };
 
 /**
- * 执行缩略图同步操作
- * 删除那些源文件不存在但缩略图还存在的冗余缩略图文件
+ * 手动同步相册与媒体数据
+ * @function manualAlbumSync
+ * @description 带密钥校验的相册与媒体库结构同步，并补齐缩略图
+ * @param {Express.Request} req
+ * @param {Express.Response} res
+ * @returns {Promise<void>}
  */
-async function performThumbnailCleanup() {
+exports.manualAlbumSync = async (req, res) => {
+  try {
+    const adminSecret = req.body?.adminSecret;
+    const buildCtx = (extra) => buildAuditContext(req, { action: 'manual_album_sync', sensitive: true, ...extra });
+    const verified = await verifySensitiveOperations(true, adminSecret, buildCtx);
+    if (!verified.ok) throw mapAdminSecretError(verified);
+
+    const result = await albumManagementService.syncAlbumsAndMedia();
+    const summary = result.summary || { added: { albums: 0, photos: 0, videos: 0, media: 0 }, removed: { albums: 0, photos: 0, videos: 0, media: 0 }, totalChanges: 0 };
+    const diff = result.diff || {};
+    const addedPhotos = diff?.addedMedia?.photo || [];
+    const addedVideos = diff?.addedMedia?.video || [];
+    const removedPhotos = diff?.removedMedia?.photo || [];
+    const removedVideos = diff?.removedMedia?.video || [];
+    const removalList = [...removedPhotos, ...removedVideos];
+
+    if (addedPhotos.length || addedVideos.length || removalList.length) {
+      try {
+        await thumbnailSyncService.updateThumbnailStatusIncremental({
+          addedPhotos,
+          addedVideos,
+          removed: removalList,
+          trigger: 'manual-sync',
+          waitForCompletion: true
+        });
+      } catch (syncError) {
+        logger.warn('缩略图增量更新失败，降级为后台全量重建:', syncError && syncError.message ? syncError.message : syncError);
+        const fallback = thumbnailSyncService.resyncThumbnailStatus({
+          trigger: 'manual-sync-fallback',
+          waitForCompletion: false
+        });
+        const fallbackPromise = fallback && typeof fallback.then === 'function'
+          ? fallback
+          : fallback?.promise;
+        if (fallbackPromise && typeof fallbackPromise.then === 'function') {
+          fallbackPromise.catch((fallbackError) => {
+            logger.error('缩略图状态全量重建失败（降级阶段）:', fallbackError && fallbackError.message ? fallbackError.message : fallbackError);
+          });
+        }
+      }
+    }
+    const message = summary.totalChanges > 0 ? '手动同步完成' : '没有检测到需要同步的内容';
+    logger.info(JSON.stringify(buildCtx({ status: 'approved', summary })));
+
+    res.json({
+      success: true,
+      message,
+      summary,
+      changesApplied: Boolean(result.changesApplied),
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error('手动同步相册失败:', error);
+    throw error;
+  }
+};
+
+/**
+ * 单独校验管理员密钥合法性
+ * @function verifyAdminSecretOnly
+ * @param {Express.Request} req
+ * @param {Express.Response} res
+ * @returns {Promise<void>}
+ */
+exports.verifyAdminSecretOnly = async (req, res) => {
+  try {
+    const adminSecret = req.body?.adminSecret;
+    const buildCtx = (extra) => buildAuditContext(req, { action: 'verify_admin_secret', sensitive: true, ...extra });
+    const verified = await verifySensitiveOperations(true, adminSecret, buildCtx);
+    if (!verified.ok) throw mapAdminSecretError(verified);
+
+    logger.info(JSON.stringify(buildCtx({ status: 'approved' })));
+    res.json({ success: true });
+  } catch (error) {
+    if (error instanceof AuthorizationError || error instanceof ValidationError || error instanceof ConfigurationError) {
+      logger.warn('管理员密钥单独验证失败:', error.message);
+    } else {
+      logger.error('管理员密钥单独验证失败:', error);
+    }
+    throw error;
+  }
+};
+
+/**
+ * 设置是否允许相册删除
+ * @function toggleAlbumDeletion
+ * @description 管理员密钥校验后启用/禁用相册删除功能
+ * @param {Express.Request} req
+ * @param {Express.Response} res
+ * @returns {Promise<void>}
+ */
+exports.toggleAlbumDeletion = async (req, res) => {
+  try {
+    const desired = Boolean(req.body?.enabled);
+    const adminSecret = req.body?.adminSecret;
+    const buildCtx = (extra) => buildAuditContext(req, {
+      action: 'toggle_album_deletion',
+      sensitive: true,
+      target: desired ? 'enable' : 'disable',
+      ...extra
+    });
+
+    const verified = await verifySensitiveOperations(true, adminSecret, buildCtx);
+    if (!verified.ok) throw mapAdminSecretError(verified);
+
+    await settingsService.updateSettings({ ALBUM_DELETE_ENABLED: desired ? 'true' : 'false' });
+    logger.info(JSON.stringify(buildCtx({ status: 'approved' })));
+
+    res.json({
+      success: true,
+      enabled: desired,
+      message: desired ? '已启用相册删除' : '已禁用相册删除',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error('切换相册删除开关失败:', error);
+    throw error;
+  }
+};
+
+/**
+ * 更新手动同步计划（定时任务）
+ * @function updateManualSyncSchedule
+ * @description 允许修改/关闭手动同步计划（需管理员密钥）
+ * @param {Express.Request} req
+ * @param {Express.Response} res
+ * @returns {Promise<void>}
+ */
+exports.updateManualSyncSchedule = async (req, res) => {
+  try {
+    const scheduleInput = req.body?.schedule;
+    const adminSecret = req.body?.adminSecret;
+    const buildCtx = (extra) => buildAuditContext(req, {
+      action: 'update_manual_sync_schedule',
+      sensitive: true,
+      schedule: scheduleInput,
+      ...extra
+    });
+
+    const verified = await verifySensitiveOperations(true, adminSecret, buildCtx);
+    if (!verified.ok) throw mapAdminSecretError(verified);
+
+    let normalized;
     try {
-        const { dbAll, runAsync } = require('../db/multi-db');
-        const { THUMBS_DIR, PHOTOS_DIR } = require('../config');
-        const { promises: fsp } = require('fs');
-        const path = require('path');
-
-        // 获取数据库中记录的所有缩略图状态 - 使用分页查询避免超时
-        const allThumbs = await queryWithPaginationAndRetry('main', "SELECT path, status FROM thumb_status");
-        let deletedCount = 0;
-        let errorCount = 0;
-
-        for (const thumb of allThumbs) {
-            try {
-                // 检查源文件是否存在
-                const sourcePath = path.join(PHOTOS_DIR, thumb.path);
-                const sourceExists = await fsp.access(sourcePath).then(() => true).catch(() => false);
-
-                if (!sourceExists) {
-                    // 源文件不存在，删除对应的缩略图文件
-                    const isVideo = /\.(mp4|webm|mov)$/i.test(thumb.path);
-                    const ext = isVideo ? '.jpg' : '.webp';
-                    const thumbRelPath = thumb.path.replace(/\.[^.]+$/, ext);
-                    const thumbAbsPath = path.join(THUMBS_DIR, thumbRelPath);
-
-                    try {
-                        await fsp.unlink(thumbAbsPath);
-                        // 从数据库中删除记录
-                        await runAsync('main', "DELETE FROM thumb_status WHERE path=?", [thumb.path]);
-                        deletedCount++;
-                        logger.info(`删除冗余缩略图文件: ${thumbAbsPath}`);
-                    } catch (fileError) {
-                        // 缩略图文件可能不存在，这是正常的
-                        if (fileError.code !== 'ENOENT') {
-                            logger.warn(`删除缩略图文件失败: ${thumbAbsPath}`, fileError);
-                        }
-                        // 即使文件不存在，也要删除数据库记录
-                        await runAsync('main', "DELETE FROM thumb_status WHERE path=?", [thumb.path]);
-                        deletedCount++;
-                    }
-                }
-            } catch (error) {
-                logger.warn(`处理缩略图同步时出错: ${thumb.path}`, error);
-                errorCount++;
-            }
-        }
-
-        logger.info(`缩略图同步完成：删除 ${deletedCount} 个冗余缩略图文件，${errorCount} 个处理出错`);
-        return { deleted: deletedCount, errors: errorCount };
+      normalized = await manualSyncScheduler.updateSchedule(scheduleInput);
     } catch (error) {
-        logger.error('缩略图同步失败:', error);
-        throw error;
+      throw mapScheduleUpdateError(error);
     }
-}
+    logger.info(JSON.stringify(buildCtx({ status: 'approved', normalizedSchedule: normalized.raw })));
 
-/**
- * 执行HLS清理操作  
- * 删除那些源视频不存在但HLS文件还存在的冗余HLS文件
- */
-async function performHlsCleanup() {
-    try {
-        const { dbAll } = require('../db/multi-db');
-        const { THUMBS_DIR, PHOTOS_DIR } = require('../config');
-        const { promises: fsp } = require('fs');
-        const path = require('path');
-
-        // 获取数据库中记录的所有视频文件 - 使用分页查询避免超时
-        const allVideos = await queryWithPaginationAndRetry('main', "SELECT path FROM items WHERE type='video'");
-        const sourceVideoPaths = new Set(allVideos.map(v => v.path));
-
-        const hlsDir = path.join(THUMBS_DIR, 'hls');
-        let deletedCount = 0;
-        let errorCount = 0;
-
-        // 递归扫描HLS目录，检查对应的源视频文件是否存在
-        async function scanAndDelete(dir, relativePath = '') {
-            try {
-                const entries = await fsp.readdir(dir, { withFileTypes: true });
-                for (const entry of entries) {
-                    const fullPath = path.join(dir, entry.name);
-                    const currentRelativePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
-
-                    if (entry.isDirectory()) {
-                        // 递归扫描子目录
-                        await scanAndDelete(fullPath, currentRelativePath);
-                        
-                        // 检查目录是否为空，如果为空则删除
-                        try {
-                            const remainingEntries = await fsp.readdir(fullPath);
-                            if (remainingEntries.length === 0) {
-                                await fsp.rmdir(fullPath);
-                                logger.info(`删除空的HLS目录: ${fullPath}`);
-                            }
-                        } catch (error) {
-                            // 忽略删除空目录的错误
-                        }
-                    } else if (entry.name === 'master.m3u8') {
-                        // 找到HLS主文件，检查对应的源视频是否存在
-                        // HLS文件结构：/hls/complete/video/file/path.mp4/master.m3u8
-                        // 对应的源视频：/complete/video/file/path.mp4
-                        
-                        // relativePath 就是完整的视频文件路径（包含扩展名）
-                        // 直接检查这个路径是否在数据库中存在
-                        const sourceVideoExists = sourceVideoPaths.has(relativePath);
-                        
-                        if (!sourceVideoExists) {
-                            // 源视频不存在，删除整个HLS目录
-                            const dirToDelete = path.dirname(fullPath);
-                            logger.warn(`准备删除HLS目录，因为找不到对应的源视频。HLS路径: ${relativePath}, 源视频路径: ${relativePath}`);
-                            
-                            try {
-                                await fsp.rm(dirToDelete, { recursive: true, force: true });
-                                deletedCount++;
-                                logger.info(`删除冗余HLS目录: ${dirToDelete}`);
-                            } catch (deleteError) {
-                                logger.warn(`删除HLS目录失败: ${dirToDelete}`, deleteError);
-                                errorCount++;
-                            }
-                        } else {
-                            logger.debug(`保留HLS目录，因为找到对应的源视频: ${relativePath}`);
-                        }
-                    }
-                }
-            } catch (error) {
-                logger.warn(`扫描HLS目录失败: ${dir}`, error);
-                errorCount++;
-            }
-        }
-
-        // 检查HLS目录是否存在
-        try {
-            await fsp.access(hlsDir);
-            await scanAndDelete(hlsDir);
-        } catch (error) {
-            if (error.code !== 'ENOENT') {
-                logger.warn('访问HLS目录失败:', error);
-            }
-        }
-
-        logger.info(`HLS清理完成：删除 ${deletedCount} 个冗余HLS目录，${errorCount} 个处理出错`);
-        return { deleted: deletedCount, errors: errorCount };
-    } catch (error) {
-        logger.error('HLS清理失败:', error);
-        throw error;
-    }
-}
-
-/**
- * 检查是否需要同步
- * 检查缩略图/HLS是否与源文件同步
- */
-async function checkSyncStatus(type) {
-    try {
-        const { dbAll } = require('../db/multi-db');
-        const { THUMBS_DIR, PHOTOS_DIR } = require('../config');
-        const { promises: fsp } = require('fs');
-        const path = require('path');
-
-        if (type === 'thumbnail') {
-            // 检查缩略图同步状态 - 使用分页查询避免超时
-            const allThumbs = await queryWithPaginationAndRetry('main', "SELECT path FROM thumb_status");
-            let redundantCount = 0;
-
-            for (const thumb of allThumbs) {
-                const sourcePath = path.join(PHOTOS_DIR, thumb.path);
-                const sourceExists = await fsp.access(sourcePath).then(() => true).catch(() => false);
-                if (!sourceExists) {
-                    redundantCount++;
-                }
-            }
-
-            const total = allThumbs.length;
-            const synced = total - redundantCount;
-            return { total, synced, redundant: redundantCount, isSynced: redundantCount === 0 };
-
-        } else if (type === 'hls') {
-            // 检查HLS同步状态 - 使用分页查询避免超时
-            const allVideos = await queryWithPaginationAndRetry('main', "SELECT path FROM items WHERE type='video'");
-            const sourceVideoPaths = new Set(allVideos.map(v => v.path));
-
-            const hlsDir = path.join(THUMBS_DIR, 'hls');
-            let totalHlsDirs = 0;
-            let redundantHlsDirs = 0;
-
-            async function scanHlsDirs(dir, relativePath = '') {
-                try {
-                    const entries = await fsp.readdir(dir, { withFileTypes: true });
-                    for (const entry of entries) {
-                        const fullPath = path.join(dir, entry.name);
-                        const currentRelativePath = relativePath ? path.join(relativePath, entry.name) : entry.name;
-
-                        if (entry.isDirectory()) {
-                            totalHlsDirs++;
-                            const videoExists = sourceVideoPaths.has(currentRelativePath);
-                            if (!videoExists) {
-                                redundantHlsDirs++;
-                            } else {
-                                await scanHlsDirs(fullPath, currentRelativePath);
-                            }
-                        }
-                    }
-                } catch (error) {
-                    // 忽略错误
-                }
-            }
-
-            await scanHlsDirs(hlsDir);
-            const synced = totalHlsDirs - redundantHlsDirs;
-            return { total: totalHlsDirs, synced, redundant: redundantHlsDirs, isSynced: redundantHlsDirs === 0 };
-        }
-
-        return { total: 0, synced: 0, redundant: 0, isSynced: true };
-    } catch (error) {
-        logger.warn(`检查${type}同步状态失败:`, error);
-        return { total: 0, synced: 0, redundant: 0, isSynced: false, error: error.message };
-    }
-}
-
-/**
- * 触发同步操作
- * 根据类型执行相应的同步操作
- */
-async function triggerCleanupOperation(type) {
-    // 先检查同步状态
-    const syncStatus = await checkSyncStatus(type);
-
-    if (syncStatus.isSynced) {
-        return {
-            message: `${getTypeDisplayName(type)}已经处于同步状态，无需清理`,
-            status: syncStatus,
-            skipped: true
-        };
-    }
-
-    switch (type) {
-        case 'thumbnail':
-            // 执行缩略图同步
-            const thumbResult = await performThumbnailCleanup();
-            return {
-                message: `缩略图同步完成：删除 ${thumbResult.deleted} 个冗余文件`,
-                status: syncStatus,
-                result: thumbResult
-            };
-
-        case 'hls':
-            // 执行HLS同步
-            const hlsResult = await performHlsCleanup();
-            return {
-                message: `HLS同步完成：删除 ${hlsResult.deleted} 个冗余目录`,
-                status: syncStatus,
-                result: hlsResult
-            };
-
-        case 'all':
-            // 执行所有同步操作
-            const thumbResultAll = await performThumbnailCleanup();
-            const hlsResultAll = await performHlsCleanup();
-            return {
-                message: `全量同步完成：缩略图删除 ${thumbResultAll.deleted} 个，HLS删除 ${hlsResultAll.deleted} 个`,
-                status: {
-                    thumbnail: await checkSyncStatus('thumbnail'),
-                    hls: await checkSyncStatus('hls')
-                },
-                result: { thumbnail: thumbResultAll, hls: hlsResultAll }
-            };
-
-        default:
-            throw new Error('未知的同步类型');
-    }
-}
-
-/**
- * 获取类型显示名称
- */
-function getTypeDisplayName(type) {
-    const names = {
-        'index': '索引',
-        'thumbnail': '缩略图',
-        'hls': 'HLS',
-        'all': '全部'
-    };
-    return names[type] || type;
-}
-
-// 导出 triggerSyncOperation 函数供启动时自动调用
-exports.triggerSyncOperation = triggerSyncOperation;
-
-
-
-
-
+    const status = manualSyncScheduler.getStatus();
+    res.json({
+      success: true,
+      schedule: status.schedule,
+      type: status.type,
+      running: status.running,
+      nextRunAt: status.nextRunAt,
+      lastRunAt: status.lastRunAt,
+      message: status.type === 'off' ? '已关闭自动维护计划' : '已更新自动维护计划'
+    });
+  } catch (error) {
+    logger.error('更新手动同步计划失败:', error);
+    throw error;
+  }
+};

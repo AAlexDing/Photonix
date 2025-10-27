@@ -1,57 +1,76 @@
-// frontend/js/main.js
+/**
+ * @file frontend/js/main.js
+ * @description 应用主入口，负责初始化前端各核心模块
+ */
 
-import { state, elements } from './state.js';
-import { initializeAuth, showLoginScreen, getAuthToken, removeAuthToken, checkAuthStatus } from './auth.js';
-import { fetchSettings } from './api.js';
-import { showSkeletonGrid } from './loading-states.js';
-import { showNotification } from './utils.js';
-import { initializeSSE } from './sse.js';
-import { handleError, ErrorTypes, ErrorSeverity } from './error-handler.js';
-import { setupEventListeners } from './listeners.js';
-import { initializeRouter } from './router.js';
-import { blobUrlManager, savePageLazyState, restorePageLazyState, clearRestoreProtection } from './lazyload.js';
-import { initializeUI } from './ui.js';
+import { state, clearExpiredAlbumTombstones } from './core/state.js';
+import { initializeAuth, showLoginScreen, getAuthToken, removeAuthToken, checkAuthStatus } from './app/auth.js';
+import { fetchSettings, clearAuthHeadersCache } from './app/api.js';
+import { showMinimalLoader } from './features/gallery/loading-states.js';
+import { showNotification } from './shared/utils.js';
+import { initializeSSE } from './app/sse.js';
+import { setupEventListeners } from './features/gallery/listeners.js';
+import { initializeRouter } from './app/router.js';
+import { blobUrlManager } from './features/gallery/lazyload.js';
+import { saveLazyLoadState, restoreLazyLoadState, clearLazyLoadProtection } from './features/gallery/lazyload-state-manager.js';
+import { initializeUI } from './features/gallery/ui.js';
+import { UI } from './core/constants.js';
+import { createModuleLogger } from './core/logger.js';
+import { safeSetInnerHTML, safeGetElementById, safeQuerySelector, safeClassList } from './shared/dom-utils.js';
+import { eventManager } from './core/event-manager.js';
 
-// 将懒加载状态管理函数暴露到全局
-window.savePageLazyState = savePageLazyState;
-window.restorePageLazyState = restorePageLazyState;
-window.clearRestoreProtection = clearRestoreProtection;
+const mainLogger = createModuleLogger('Main');
 
 let appStarted = false;
 
-// 生成与 frontend/assets/icon.svg 相同的 SVG，并设置为 favicon（运行时注入，避免静态依赖）
+/**
+ * 显示首页快捷键提示（仅首次访问）
+ */
+function showGalleryShortcutsHint() {
+    // 移动端不显示
+    if (window.innerWidth <= 768) return;
+
+    // 检查是否已经显示过
+    const hasShown = localStorage.getItem('hasShownGalleryShortcuts');
+    if (hasShown) return;
+
+    // 等待页面完全加载后显示
+    setTimeout(() => {
+        const hintEl = document.getElementById('gallery-shortcuts-hint');
+        if (!hintEl) return;
+
+        safeClassList(hintEl, 'add', 'show');
+        
+        // 标记已显示，下次不再显示
+        try {
+            localStorage.setItem('hasShownGalleryShortcuts', 'true');
+        } catch (e) {
+            mainLogger.warn('无法保存快捷键提示状态', e);
+        }
+
+        // 6秒后自动隐藏（动画会处理）
+        setTimeout(() => {
+            safeClassList(hintEl, 'remove', 'show');
+        }, 6000);
+    }, 1500); // 延迟1.5秒，让用户先看到页面内容
+}
+
+/**
+ * 生成与 frontend/assets/icon.svg 相同的 SVG，并设置为 favicon（运行时注入，避免静态依赖）
+ */
 function applyAppIcon() {
-    const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg width="192" height="192" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="ring-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#8B5CF6" />
-      <stop offset="100%" stop-color="#F472B6" />
-    </linearGradient>
-    <radialGradient id="core-glow" cx="50%" cy="50%" r="50%" fx="50%" fy="50%">
-      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="1" />
-      <stop offset="70%" stop-color="#F472B6" stop-opacity="0.8" />
-      <stop offset="100%" stop-color="#8B5CF6" stop-opacity="0" />
-    </radialGradient>
-    <style>
-      .ring { fill: none; stroke-width: 2; transform-origin: 50% 50%; }
-      .core { transform-origin: 50% 50%; animation: pulse 3s ease-in-out infinite; }
-      @keyframes rotate-cw { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-      @keyframes rotate-ccw { from { transform: rotate(0deg); } to { transform: rotate(-360deg); } }
-      @keyframes pulse { 0% { transform: scale(0.9); opacity: 0.8; } 50% { transform: scale(1.1); opacity: 1; } 100% { transform: scale(0.9); opacity: 0.8; } }
-      #outer-ring { animation: rotate-cw 20s linear infinite; }
-      #middle-ring { animation: rotate-ccw 15s linear infinite; }
-      #inner-ring { animation: rotate-cw 10s linear infinite; }
-    </style>
-  </defs>
-  <circle cx="50" cy="50" r="50" fill="#111827" />
-  <circle class="core" cx="50" cy="50" r="15" fill="url(#core-glow)" />
-  <circle id="outer-ring" class="ring" cx="50" cy="50" r="45" stroke="url(#ring-gradient)" stroke-opacity="0.5" />
-  <circle id="middle-ring" class="ring" cx="50" cy="50" r="35" stroke="url(#ring-gradient)" />
-  <circle id="inner-ring" class="ring" cx="50" cy="50" r="25" stroke="white" stroke-opacity="0.8" />
-</svg>`;
+    const svg = `<svg width="32" height="32" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <defs>
+                                    <linearGradient id="logo-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                        <stop offset="0%" style="stop-color:#a78bfa;stop-opacity:1"></stop>
+                                        <stop offset="70%" style="stop-color:#f472b6;stop-opacity:1"></stop>
+                                        <stop offset="100%" style="stop-color:#f87171;stop-opacity:1"></stop>
+                                    </linearGradient>
+                                </defs>
+                                <path fill="url(#logo-gradient)" d="M50,0 C77.61,0 100,22.39 100,50 C100,77.61 77.61,100 50,100 C22.39,100 0,77.61 0,50 C0,22.39 22.39,0 50,0 Z M50,15 C30.67,15 15,30.67 15,50 C15,69.33 30.67,85 50,85 C69.33,85 85,69.33 85,50 C85,30.67 69.33,15 50,15 Z M62.5,25 L37.5,25 L37.5,50 L62.5,50 C69.4,50 75,44.4 75,37.5 C75,30.6 69.4,25 62.5,25 Z"></path>
+                            </svg>`;
     const dataUrl = 'data:image/svg+xml;utf8,' + encodeURIComponent(svg);
-    let linkEl = document.querySelector('link[rel="icon"]');
+    let linkEl = safeQuerySelector('link[rel="icon"]');
     if (!linkEl) {
         linkEl = document.createElement('link');
         linkEl.setAttribute('rel', 'icon');
@@ -62,34 +81,46 @@ function applyAppIcon() {
 }
 
 /**
- * 统一的UI状态机，管理应用、登录、错误等不同视图状态的切换
+ * 统一的 UI 状态机，管理应用、登录、错误等不同视图状态的切换
  * @param {'app'|'login'|'error'} nextState - 目标状态
  * @param {object} [options] - 附加选项
  */
 function setUIState(nextState, options = {}) {
-    const app = document.getElementById('app-container');
-    const overlay = document.getElementById('auth-overlay');
+    const app = safeGetElementById('app-container');
+    const overlay = safeGetElementById('auth-overlay');
 
+    /**
+     * 隐藏认证遮罩层
+     */
     const hideOverlay = () => {
         if (!overlay) return;
-        overlay.classList.remove('opacity-100');
-        overlay.classList.add('opacity-0', 'pointer-events-none');
+        safeClassList(overlay, 'remove', 'opacity-100');
+        safeClassList(overlay, 'add', 'opacity-0');
+        safeClassList(overlay, 'add', 'pointer-events-none');
     };
+    /**
+     * 显示认证遮罩层
+     */
     const showOverlay = () => {
         if (!overlay) return;
-        overlay.classList.remove('opacity-0', 'pointer-events-none');
-        overlay.classList.add('opacity-100');
+        safeClassList(overlay, 'remove', 'opacity-0');
+        safeClassList(overlay, 'remove', 'pointer-events-none');
+        safeClassList(overlay, 'add', 'opacity-100');
     };
 
     switch (nextState) {
         case 'app':
-            app?.classList.remove('opacity-0');
-            app?.classList.add('opacity-100');
+            if (app) {
+                safeClassList(app, 'remove', 'opacity-0');
+                safeClassList(app, 'add', 'opacity-100');
+            }
             hideOverlay();
             break;
         case 'login':
-            app?.classList.remove('opacity-100');
-            app?.classList.add('opacity-0');
+            if (app) {
+                safeClassList(app, 'remove', 'opacity-100');
+                safeClassList(app, 'add', 'opacity-0');
+            }
             showOverlay();
             break;
         case 'error':
@@ -102,6 +133,7 @@ function setUIState(nextState, options = {}) {
  * 应用初始化函数
  */
 async function initializeApp() {
+    try { clearExpiredAlbumTombstones(); } catch {}
     // 注入与静态文件一致的 SVG 图标，避免启动时找不到 /assets 时的 404
     try { applyAppIcon(); } catch {}
     // 1. 初始化基础组件和事件监听
@@ -109,7 +141,7 @@ async function initializeApp() {
     try {
         setupEventListeners();
     } catch (e) {
-        console.error('事件监听器加载失败:', e);
+        mainLogger.error('事件监听器加载失败', e);
     }
 
     // 2. 检查认证状态，决定显示登录页还是主应用
@@ -125,23 +157,20 @@ async function initializeApp() {
             startMainApp();
         }
     } catch (error) {
-        console.error('应用初始化失败:', error);
-        
-        // 记录错误但避免触发额外的网络请求
-        console.error('应用初始化错误:', error);
-        
+        mainLogger.error('应用初始化失败', error);
+
         setUIState('error');
-        const authContainer = document.getElementById('auth-container');
+        const authContainer = safeGetElementById('auth-container');
         if(authContainer) {
-            authContainer.innerHTML = `
+            safeSetInnerHTML(authContainer, `
                 <div class="auth-card text-center">
                     <h2 class="auth-title text-red-500">应用加载失败</h2>
                     <p class="text-gray-300">无法连接到服务器，请刷新页面重试。</p>
                     <button id="refresh-btn" class="btn btn-primary mt-4">刷新页面</button>
-                    <p class="text-gray-400 text-sm mt-2">${error.message}</p>
+                    <p class="text-gray-400 text-sm mt-2">${error.message ? error.message.replace(/[<>]/g, '') : '未知错误'}</p>
                 </div>
-            `;
-            document.getElementById('refresh-btn')?.addEventListener('click', () => window.location.reload());
+            `);
+            safeGetElementById('refresh-btn')?.addEventListener('click', () => window.location.reload());
         }
     }
 }
@@ -153,24 +182,126 @@ function startMainApp() {
     if (appStarted) return;
     appStarted = true;
 
-    showSkeletonGrid();
+    showMinimalLoader({ text: '初始化中...' });
     initializeSSE();
     initializeUI();
 
     try {
         initializeRouter();
     } catch (e) {
-        console.error('路由器加载失败:', e);
+        mainLogger.error('路由器加载失败', e);
     }
     loadAppSettings();
 
-    // 设置全局事件监听
-    window.addEventListener('offline', () => showNotification('网络已断开', 'warning', 5000));
-    window.addEventListener('online', () => showNotification('网络已恢复', 'success', 3000));
+    // 显示首页快捷键提示（仅首次访问，仅PC端）
+    showGalleryShortcutsHint();
+
+    // 🔧 修复问题2：网络状态通知去抖，避免移动设备/内网穿透环境频繁提示
+    let offlineNotificationTimer = null;
+    let wasOfflineNotified = false;
+    
+    window.addEventListener('offline', () => {
+        // 延迟3秒后才显示通知，避免短暂断连误报
+        if (offlineNotificationTimer) clearTimeout(offlineNotificationTimer);
+        offlineNotificationTimer = setTimeout(() => {
+            if (!navigator.onLine) { // 再次确认确实断开
+                showNotification('网络连接不稳定', 'warning', UI.NOTIFICATION_DURATION_WARNING);
+                wasOfflineNotified = true;
+            }
+        }, 3000);
+    });
+    
+    window.addEventListener('online', () => {
+        // 清除待显示的offline通知
+        if (offlineNotificationTimer) {
+            clearTimeout(offlineNotificationTimer);
+            offlineNotificationTimer = null;
+        }
+        // 只有之前显示过断开通知，才显示恢复通知
+        if (wasOfflineNotified) {
+            showNotification('网络已恢复', 'success', UI.NOTIFICATION_DURATION_SUCCESS);
+            wasOfflineNotified = false;
+        }
+    });
+    
     window.addEventListener('auth:required', () => {
         removeAuthToken();
         setUIState('login');
         showLoginScreen();
+    });
+
+    // 监听认证状态变更事件
+    window.addEventListener('auth:statusChanged', async (event) => {
+        const { passwordEnabled } = event.detail;
+        mainLogger.info('认证状态变更，重新检查', { passwordEnabled });
+
+        try {
+            // 清除 API 缓存中的认证头，避免使用过时的认证信息
+            if (typeof clearAuthHeadersCache === 'function') {
+                clearAuthHeadersCache();
+            }
+
+            const token = getAuthToken();
+
+            if (passwordEnabled) {
+                // 密码已启用
+                if (!token) {
+                    // 没有令牌，需要重新登录
+                    setUIState('login');
+                    showLoginScreen();
+                } else {
+                    // 有令牌，重新检查认证状态
+                    const authStatus = await checkAuthStatus();
+                    if (!authStatus.passwordEnabled) {
+                        // 后端密码已关闭但前端仍有令牌，需要重新登录
+                        removeAuthToken();
+                        setUIState('login');
+                        showLoginScreen();
+                    } else {
+                        // 密码仍然启用，正常显示主应用
+                        setUIState('app');
+                        startMainApp();
+                    }
+                }
+            } else {
+                // 密码已关闭
+                if (token) {
+                    // 有令牌但密码已关闭，清除令牌并重新初始化
+                    removeAuthToken();
+                    setUIState('app');
+                    // 重新初始化应用以清除所有认证相关的状态
+                    if (!appStarted) {
+                        startMainApp();
+                    } else {
+                        // 如果应用已经启动，重新初始化路由
+                        try {
+                            initializeRouter();
+                        } catch (e) {
+                            mainLogger.error('路由器重新初始化失败', e);
+                        }
+                    }
+                } else {
+                    // 没有令牌，正常显示主应用
+                    setUIState('app');
+                    if (!appStarted) {
+                        startMainApp();
+                    }
+                }
+            }
+        } catch (error) {
+            mainLogger.error('认证状态重新检查失败', error);
+            // 如果检查失败且没有令牌，默认显示登录页面
+            if (!getAuthToken()) {
+                setUIState('login');
+                showLoginScreen();
+            } else {
+                // 有令牌但检查失败，显示主应用
+                setUIState('app');
+                if (!appStarted) {
+                    startMainApp();
+                }
+            }
+        }
     });
 }
 
@@ -181,93 +312,105 @@ async function loadAppSettings() {
     try {
         const clientSettings = await fetchSettings();
         const localAI = JSON.parse(localStorage.getItem('ai_settings') || '{}');
-        
-        state.update('aiEnabled', (localAI.AI_ENABLED !== undefined) ? (localAI.AI_ENABLED === 'true') : (clientSettings.AI_ENABLED === 'true'));
-        state.update('passwordEnabled', clientSettings.PASSWORD_ENABLED === 'true');
+
+        state.batchUpdate({
+            aiEnabled: (localAI.AI_ENABLED !== undefined) ? (localAI.AI_ENABLED === 'true') : (clientSettings.AI_ENABLED === 'true'),
+            passwordEnabled: clientSettings.PASSWORD_ENABLED === 'true',
+            albumDeletionEnabled: Boolean(clientSettings.albumDeletionEnabled),
+            adminSecretConfigured: Boolean(clientSettings.isAdminSecretConfigured)
+        });
     } catch (e) {
-        console.warn("无法获取应用设置:", e.message);
-        
-        // 使用统一错误处理 - 避免触发额外的网络请求
-        console.warn("设置加载失败，使用默认配置:", e.message);
-        
-        state.batchUpdate({ aiEnabled: false, passwordEnabled: false });
+        mainLogger.warn("无法获取应用设置，使用默认配置", e);
+
+        state.batchUpdate({
+            aiEnabled: false,
+            passwordEnabled: false,
+            albumDeletionEnabled: false,
+            adminSecretConfigured: false
+        });
     }
 }
 
-// Service Worker 注册
+/**
+ * Service Worker 注册
+ */
 if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
         navigator.serviceWorker.register('/sw.js')
-            .then(registration => console.log('ServiceWorker 注册成功，作用域: ', registration.scope))
-            .catch(err => console.log('ServiceWorker 注册失败: ', err));
+            .then(registration => {
+                mainLogger.info('ServiceWorker 注册成功', { scope: registration.scope });
+            })
+            .catch(err => {
+                mainLogger.error('ServiceWorker 注册失败', err);
+            });
     });
 }
 
-// 智能缓存清理策略
-let pageHiddenTime = 0;
-let isPageReallyHidden = false;
+function initializeLifecycleGuards() {
+    const pageSessionId = Date.now().toString();
+    sessionStorage.setItem('pageSessionId', pageSessionId);
+    mainLogger.debug('初始化异步操作管理器', { sessionId: pageSessionId });
 
-// 初始化页面会话ID
-const sessionId = Date.now().toString();
-sessionStorage.setItem('pageSessionId', sessionId);
-// 减少会话ID日志输出，只在开发模式下输出
-if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-    console.debug(`[会话管理] 初始化会话ID: ${sessionId}`);
+    let pageHiddenTime = 0;
+    let hideCleanupTimeout = null;
+    let isPageReallyHidden = false;
+
+    window.addEventListener('beforeunload', () => {
+        try {
+            blobUrlManager.cleanupAll();
+            saveLazyLoadState(window.location.hash);
+            eventManager.destroy();
+            mainLogger.debug('页面卸载，完成缓存和事件清理');
+        } catch (error) {
+            mainLogger.warn('页面卸载清理失败', error);
+        }
+    });
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+            pageHiddenTime = Date.now();
+            isPageReallyHidden = false;
+
+            if (hideCleanupTimeout) {
+                clearTimeout(hideCleanupTimeout);
+            }
+
+            hideCleanupTimeout = setTimeout(() => {
+                if (document.visibilityState === 'hidden' && !isPageReallyHidden) {
+                    isPageReallyHidden = true;
+                    mainLogger.debug('页面长时间隐藏，开始清理部分缓存');
+                    try {
+                        blobUrlManager.cleanupExpired();
+                        saveLazyLoadState(window.location.hash);
+                    } catch (error) {
+                        mainLogger.warn('页面隐藏清理失败', error);
+                    }
+                }
+            }, 10000);
+        } else {
+            isPageReallyHidden = false;
+            if (hideCleanupTimeout) {
+                clearTimeout(hideCleanupTimeout);
+                hideCleanupTimeout = null;
+            }
+
+            if (pageHiddenTime > 0) {
+                const hiddenDuration = Date.now() - pageHiddenTime;
+                if (hiddenDuration < 30000) {
+                    mainLogger.debug('页面短暂隐藏，保持缓存');
+                } else {
+                    mainLogger.debug('页面长时间隐藏后重新可见', { hiddenDuration });
+                }
+            }
+
+            pageHiddenTime = 0;
+        }
+    });
 }
 
-// blob URL清理逻辑 - 只在真正离开时清理
-window.addEventListener('beforeunload', () => {
-    // 真正离开页面时才清理所有缓存
-    blobUrlManager.cleanupAll();
-    // 清理页面状态缓存
-    if (window.savePageLazyState) {
-        window.savePageLazyState(window.location.hash);
-    }
-});
+initializeLifecycleGuards();
 
-// 页面隐藏时的智能处理
-document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
-        pageHiddenTime = Date.now();
-        isPageReallyHidden = false;
-
-        // 延迟清理，给临时切换标签页预留时间
-        setTimeout(() => {
-            if (document.visibilityState === 'hidden' && !isPageReallyHidden) {
-                isPageReallyHidden = true;
-                // 减少缓存清理日志输出，只在开发模式下输出
-                if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-                    console.debug('[缓存清理] 页面长时间隐藏，开始清理部分缓存');
-                }
-
-                // 只清理过期缓存，不清理所有缓存
-                blobUrlManager.cleanupExpired();
-
-                // 保存当前页面状态以便恢复
-                if (window.savePageLazyState && window.location.hash) {
-                    window.savePageLazyState(window.location.hash);
-                }
-            }
-        }, 10000); // 10秒后开始清理（比原来短）
-    } else {
-        // 页面重新可见
-        isPageReallyHidden = false;
-        const hiddenDuration = Date.now() - pageHiddenTime;
-
-        if (hiddenDuration < 30000) {
-            // 减少短暂隐藏日志输出，只在开发模式下输出
-            if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-                console.debug('[缓存恢复] 页面短暂隐藏，保持缓存');
-            }
-        } else {
-            // 减少长时间隐藏日志输出，只在开发模式下输出
-            if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-                console.debug('[缓存恢复] 页面长时间隐藏后重新可见');
-            }
-            // 可以在这里添加缓存预热逻辑
-        }
-    }
-});
-
-// 应用启动入口
+/**
+ * 应用启动入口
+ */
 document.addEventListener('DOMContentLoaded', initializeApp);

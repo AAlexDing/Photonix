@@ -7,6 +7,8 @@ const router = express.Router();
 const searchController = require('../controllers/search.controller');
 const { cache } = require('../middleware/cache');
 const { validate, Joi, asyncHandler } = require('../middleware/validation');
+const { requirePermission, PERMISSIONS } = require('../middleware/permissions');
+const { validateInput, VALIDATION_RULES } = require('../middleware/inputValidation');
 
 // 搜索参数校验
 const searchSchema = Joi.object({
@@ -15,10 +17,17 @@ const searchSchema = Joi.object({
   limit: Joi.number().integer().min(1).max(200).optional()
 });
 
-// 搜索功能路由（缓存1小时）
-// 为搜索结果应用3600秒（1小时）的缓存，减少重复搜索的服务器负载
-// 提高搜索响应速度，特别是对于相同关键词的重复搜索
-router.get('/', validate(searchSchema, 'query'), cache(3600), asyncHandler(searchController.searchItems));
+// 搜索功能路由（缓存缩短至 180 秒，与前端 SW TTL 对齐）
+// 可通过 SEARCH_CACHE_TTL 环境变量覆盖默认缓存时长
+const SEARCH_CACHE_TTL = Number(process.env.SEARCH_CACHE_TTL || 180);
+
+router.get('/',
+    validateInput(VALIDATION_RULES.searchQuery),
+    requirePermission(PERMISSIONS.SEARCH_FILES),
+    validate(searchSchema, 'query'),
+    cache(SEARCH_CACHE_TTL),
+    asyncHandler(searchController.searchItems)
+);
 
 // 导出搜索路由模块
 module.exports = router;

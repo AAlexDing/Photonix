@@ -71,8 +71,38 @@ cd Photonix
 - **生产环境**：复制 `env.production` 为 `.env`，根据需要调整
 - 或使用最小模板：复制 `env.example` 为 `.env`（仅核心必配项，其余使用代码默认值）
 
+#### 快速生成 32+ 位强随机密钥并写入 .env
+
+- Linux/macOS（bash）：
+
+```bash
+# 生成并追加到 .env（若不存在会创建），可用于 JWT_SECRET / ADMIN_SECRET
+echo "JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n')" >> .env
+echo "ADMIN_SECRET=$(openssl rand -base64 36 | tr -d '\n')" >> .env
+
+# 如需替换已存在的同名变量（谨慎）：
+[ -f .env ] && sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$(openssl rand -base64 48 | tr -d '\n')/" .env || true
+[ -f .env ] && sed -i "s/^ADMIN_SECRET=.*/ADMIN_SECRET=$(openssl rand -base64 36 | tr -d '\n')/" .env || true
+```
+
+- Windows（PowerShell）：
+
+```powershell
+# 生成并追加到 .env（若不存在会创建）
+"JWT_SECRET=$([Convert]::ToBase64String((1..48 | ForEach-Object {Get-Random -Maximum 256})))" | Out-File -FilePath .env -Append -Encoding utf8
+"ADMIN_SECRET=$([Convert]::ToBase64String((1..36 | ForEach-Object {Get-Random -Maximum 256})))" | Out-File -FilePath .env -Append -Encoding utf8
+
+# 如需替换已存在同名变量（谨慎）：
+if (Test-Path .env) {
+  (Get-Content .env) -replace '^JWT_SECRET=.*', "JWT_SECRET=$([Convert]::ToBase64String((1..48 | ForEach-Object {Get-Random -Maximum 256})))" |
+  Set-Content .env -Encoding utf8
+  (Get-Content .env) -replace '^ADMIN_SECRET=.*', "ADMIN_SECRET=$([Convert]::ToBase64String((1..36 | ForEach-Object {Get-Random -Maximum 256})))" |
+  Set-Content .env -Encoding utf8
+}
+```
+
 #### 详细配置
-- 📖 **完整配置指南**：查看 [ENV_GUIDE.md](./ENV_GUIDE.md)（精注释版）与 [ENV_GUIDE_MIN.md](./ENV_GUIDE_MIN.md)（简版速查）
+- 📖 **完整配置指南**：查看 [ENV_GUIDE.md](./env.example/ENV_GUIDE.md)（精注释版）与 [ENV_GUIDE_MIN.md](./env.example/ENV_GUIDE_MIN.md)（简版速查）
 - 🔧 **核心配置**：`PORT`、`PHOTOS_DIR`、`DATA_DIR`、`JWT_SECRET`
 - ⚡ **性能优化**：硬件自适应配置，支持 `DETECTED_CPU_COUNT` 和 `DETECTED_MEMORY_GB`
 - 🔒 **安全设置**：生产环境务必修改 `JWT_SECRET` 和 `ADMIN_SECRET`
@@ -131,8 +161,10 @@ Photonix/
 │   ├── package-lock.json                # 锁定文件
 │   ├── config/
 │   │   ├── index.js                     # 全局配置（端口/目录/Redis/Workers/索引参数）
-│   │   ├── logger.js                    # winston 日志
-│   │   └── redis.js                     # ioredis 连接与 BullMQ 队列（AI/Settings）
+│   │   ├── hardware.js                  # 硬件检测与资源配置
+│   │   ├── logger.js                    # winston 日志配置
+│   │   ├── redis.js                     # ioredis 连接与 BullMQ 队列（AI/Settings）
+│   │   └── runtime.js                   # 运行时配置管理
 │   ├── controllers/
 │   │   ├── ai.controller.js             # 接收前端 aiConfig，入队生成描述
 │   │   ├── auth.controller.js           # 登录/刷新 Token/状态检测
@@ -151,10 +183,18 @@ Photonix/
 │   │   ├── ai-rate-guard.js             # AI 配额/冷却/去重（Redis）
 │   │   ├── auth.js                      # 认证：公开访问/Token 校验/JWT_SECRET 检查
 │   │   ├── cache.js                     # 路由级 Redis 缓存与标签失效
+│   │   ├── cacheMonitor.js              # 缓存监控中间件
+│   │   ├── inputValidation.js           # 输入验证中间件
 │   │   ├── pathValidator.js             # 路径校验（防穿越）
+│   │   ├── permissions.js               # 权限控制中间件
 │   │   ├── rateLimiter.js               # 全局速率限制
 │   │   ├── requestId.js                 # 请求 ID 注入
 │   │   └── validation.js                # Joi 参数校验与 asyncHandler
+│   ├── repositories/
+│   │   ├── indexStatus.repo.js          # 索引状态数据访问层
+│   │   ├── items.repo.js                # 项目数据访问层
+│   │   ├── stats.repo.js                # 统计数据访问层
+│   │   └── thumbStatus.repo.js          # 缩略图状态数据访问层
 │   ├── routes/
 │   │   ├── ai.routes.js                 # /api/ai：生成与任务状态
 │   │   ├── auth.routes.js               # /api/auth：登录/刷新/状态
@@ -168,19 +208,29 @@ Photonix/
 │   │   └── thumbnail.routes.js          # /api/thumbnail：缩略图获取
 │   ├── services/
 │   │   ├── adaptive.service.js          # 自适应性能模式管理
+│   │   ├── ai-microservice.js           # AI微服务集成
+│   │   ├── batch.executor.js            # 批量执行器服务
 │   │   ├── cache.service.js             # 缓存标签管理/失效
 │   │   ├── event.service.js             # 事件总线（SSE）
 │   │   ├── file.service.js              # 文件与封面相关逻辑
 │   │   ├── indexer.service.js           # 监控目录/合并变更/索引调度
+│   │   ├── orchestrator.js              # 任务编排器
+│   │   ├── queryOptimizer.service.js    # 查询优化服务
 │   │   ├── search.service.js            # 搜索实现（FULLTEXT 等）
 │   │   ├── settings.service.js          # 设置缓存（内存/Redis）与持久化
 │   │   ├── thumbnail.service.js         # 缩略图高/低优队列与重试
+│   │   ├── tx.manager.js                # 事务管理器
+│   │   ├── video.service.js             # 视频处理服务
 │   │   └── worker.manager.js            # Worker 管理（缩略图/索引/视频）
 │   ├── utils/
+│   │   ├── errorHandler.js              # 错误处理工具
+│   │   ├── errorMessageTranslator.js    # 错误消息翻译器
 │   │   ├── hls.utils.js                 # HLS 视频处理工具
 │   │   ├── media.utils.js               # 媒体判定/尺寸计算等
 │   │   ├── path.utils.js                # 路径清理/安全校验
-│   │   └── search.utils.js              # 搜索辅助
+│   │   ├── search.utils.js              # 搜索辅助工具
+│   │   ├── tempFileManager.js           # 临时文件管理器
+│   │   └── time.utils.js                # 时间处理工具
 │   └── workers/
 │       ├── ai-worker.js                 # 调用外部 AI 接口，写回结果
 │       ├── history-worker.js            # 浏览历史相关任务
@@ -196,28 +246,42 @@ Photonix/
     ├── package-lock.json                 # 锁定文件
     ├── style.css                         # 全站样式（含骨架/占位/动效）
     ├── sw-src.js                         # Service Worker 源文件（构建生成 sw.js）
+    ├── sw-cache-manager.js               # Service Worker缓存管理器
     ├── workbox-config.js                 # Workbox 配置（injectManifest）
     ├── tailwind.config.js                # Tailwind 配置
     ├── assets/
     │   └── icon.svg                      # 应用图标
     └── js/
         ├── abort-bus.js                  # 统一中止控制
+        ├── ai-cache.js                   # AI缓存管理
+        ├── api-client.js                 # API客户端封装
         ├── api.js                        # API 封装（认证/设置/搜索等）
         ├── auth.js                       # 登录/Token 本地管理
+        ├── constants.js                  # 常量定义
+        ├── dom-elements.js               # DOM 元素管理（动态初始化/重新获取）
+        ├── dom-utils.js                  # DOM工具函数
         ├── error-handler.js              # 全局错误处理
+        ├── event-buffer.js               # 事件缓冲管理
+        ├── event-manager.js              # 事件管理器
         ├── indexeddb-helper.js           # IndexedDB 搜索历史/浏览记录
+        ├── lazyload-state-manager.js     # 懒加载状态管理
         ├── lazyload.js                   # 懒加载与占位/状态处理
         ├── listeners.js                  # 滚动/交互事件
         ├── loading-states.js             # 骨架/空态/错误态渲染
+        ├── logger.js                     # 日志管理
         ├── main.js                       # 启动流程与状态初始化
         ├── masonry.js                    # 瀑布流布局与列数计算
         ├── modal.js                      # 媒体预览模态框（支持双指缩放/拖拽）
         ├── router.js                     # Hash 路由与流式加载
         ├── search-history.js             # 搜索历史 UI 逻辑
+        ├── security.js                   # 安全相关功能
         ├── settings.js                   # 设置面板与本地 AI 配置
         ├── sse.js                        # SSE 连接与事件处理
         ├── state.js                      # 全局状态容器（布局模式管理）
+        ├── svg-utils.js                  # SVG工具函数
+        ├── timer-manager.js              # 定时器管理器
         ├── touch.js                      # 触摸手势（双指缩放、拖拽、滑动切换）
+        ├── ui-components.js              # UI组件库
         ├── ui.js                         # DOM 渲染与卡片组件（布局切换、瀑布流/网格）
         ├── utils.js                      # 杂项工具
         └── virtual-scroll.js             # 虚拟滚动
@@ -236,13 +300,13 @@ Photonix/
 | `RATE_LIMIT_WINDOW_MINUTES` | `1`                                             | API 速率限制的时间窗口（分钟，代码默认 1 分钟）。            |
 | `RATE_LIMIT_MAX_REQUESTS`    | `800`                                          | 在一个时间窗口内的最大请求数（代码默认 800，可按需下调）。   |
 | `JWT_SECRET`             | `your-own-very-long-and-random-secret-string-123450` | 用于签发和验证登录 Token 的密钥，请修改为复杂随机字符串。    |
-| `ADMIN_SECRET`           | `（默认admin，请手动设置）`                          | 超级管理员密钥，启用/修改/禁用访问密码等敏感操作时必需。      |
+| `ADMIN_SECRET`           | `（默认nameadmin，请手动设置）`                          | 超级管理员密钥，启用/修改/禁用访问密码等敏感操作时必需。      |
 
 > **注意：**
 > - `ADMIN_SECRET` 必须在 `.env` 文件中手动设置，否则涉及超级管理员权限的敏感操作（如设置/修改/禁用访问密码）将无法进行。
 > - 请务必将 `ADMIN_SECRET` 设置为高强度、难以猜测的字符串，并妥善保管。
 >
-> 更完整的环境变量说明与不同规模服务器的推荐配置，请参见 [ENV_GUIDE.md](./ENV_GUIDE.md)。
+> 更完整的环境变量说明与不同规模服务器的推荐配置，请参见 [ENV_GUIDE.md](./env.example/ENV_GUIDE.md)。
 >
 > Docker Compose 部署建议：在 `.env` 中设置 `REDIS_URL=redis://redis:6379`（使用服务名 `redis` 作为主机）。
 
@@ -324,42 +388,179 @@ npm start
 ### Nginx 反向代理配置
 如果在生产环境中使用 Nginx 作为反向代理，请使用以下配置以确保 **Server-Sent Events (SSE)** 正常工作。
 
+#### 为什么 SSE 需要特殊配置？
+
+SSE (Server-Sent Events) 是一种长连接、流式传输技术，与普通 HTTP 请求有本质区别：
+
+| Nginx 默认行为 | 对 SSE 的影响 | 问题 |
+|---------------|--------------|------|
+| `proxy_buffering on` | 缓冲响应数据 | 数据被缓冲，无法实时推送 |
+| `proxy_http_version 1.0` | 使用 HTTP/1.0 | 不支持长连接，每次响应后关闭 |
+| `Connection: close` | 关闭连接头 | SSE 需要保持连接打开 |
+| 短超时（60秒） | 60秒后断开 | SSE 可能需要保持数小时 |
+
+**不配置 SSE 专用规则会导致**：
+- 实时更新变成"批量更新"或超时
+- 连接频繁断开，前端报 `net::ERR_FAILED`
+- 缩略图生成进度无法实时显示
+
+#### HTTP 代理配置（仅用于开发/测试）
+
 ```nginx
 server {
     listen 80;
     server_name your-domain.com;
 
-    # 建议升级到 HTTPS
-    # listen 443 ssl http2;
-    # ssl_certificate /path/to/your/cert.pem;
-    # ssl_certificate_key /path/to/your/key.pem;
-
     client_max_body_size 0; # 允许上传大文件
 
-    location / {
-        proxy_pass http://127.0.0.1:12080; # 指向 Photonix 服务地址
+    # ⚠️ 重要：SSE 专用配置必须放在通用 location 之前
+    location /api/events {
+        proxy_pass http://127.0.0.1:12080/api/events;
+        
+        # SSE 关键配置
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';  # 清空连接头，保持长连接
+        
+        # 禁用所有缓冲，确保实时传输
+        proxy_buffering off;
+        proxy_cache off;
+        
+        # 长超时配置（24小时）
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        
+        # 支持分块传输
+        chunked_transfer_encoding on;
+        
+        # TCP 优化
+        tcp_nodelay on;
+        tcp_nopush on;
+        
+        # 标准代理头
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
-    # 针对 SSE 事件流的特殊配置
-    location /api/events {
-        proxy_pass http://127.0.0.1:12080/api/events;
-        proxy_set_header Connection '';
-        proxy_http_version 1.1;
+    # 通用代理配置
+    location / {
+        proxy_pass http://127.0.0.1:12080;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        
-        # 关键：关闭缓冲并设置长超时
-        proxy_buffering off;
-        proxy_cache off;
-        proxy_read_timeout 1h; # 保持长连接
     }
 }
+```
+
+#### HTTPS 代理配置（生产环境推荐）
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name your-domain.com;
+
+    # SSL 证书配置
+    ssl_certificate /path/to/your/fullchain.pem;
+    ssl_certificate_key /path/to/your/private.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    client_max_body_size 0;
+
+    # ⚠️ 重要：SSE 专用配置必须放在通用 location 之前
+    location /api/events {
+        proxy_pass http://127.0.0.1:12080/api/events;
+        
+        # SSE 关键配置
+        proxy_http_version 1.1;
+        proxy_set_header Connection '';
+        
+        # 禁用缓冲
+        proxy_buffering off;
+        proxy_cache off;
+        
+        # 长超时（24小时）
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        
+        # 流式传输优化
+        chunked_transfer_encoding on;
+        tcp_nodelay on;
+        tcp_nopush on;
+        
+        # 标准代理头
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 通用代理配置
+    location / {
+        proxy_pass http://127.0.0.1:12080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# HTTP 自动跳转到 HTTPS
+server {
+    listen 80;
+    server_name your-domain.com;
+    return 301 https://$server_name$request_uri;
+}
+```
+
+#### 验证 SSE 配置
+
+**方法 1：浏览器控制台测试**
+```javascript
+const es = new EventSource('https://your-domain.com/api/events');
+es.onopen = () => console.log('✅ SSE 连接成功！');
+es.onerror = (e) => console.error('❌ SSE 连接失败：', e);
+es.addEventListener('connected', (e) => console.log('📨 收到connected事件：', e.data));
+```
+
+**方法 2：命令行测试**
+```bash
+# 测试 HTTP
+curl -N -H "Accept: text/event-stream" http://your-domain.com/api/events
+
+# 测试 HTTPS
+curl -N -H "Accept: text/event-stream" https://your-domain.com/api/events
+```
+
+预期输出：
+```
+event: connected
+data: {"message":"SSE connection established.","clientId":"..."}
+
+: keep-alive
+
+: keep-alive
+```
+
+**方法 3：查看 Network 标签**
+1. 打开浏览器开发者工具（F12）
+2. 切换到 **Network** 标签
+3. 筛选 **EventStream** 类型
+4. 查找 `/api/events` 请求
+5. 状态应该是 **200** 且持续保持连接
+
+#### 常见问题排查
+
+| 现象 | 可能原因 | 解决方案 |
+|------|---------|---------|
+| 连接立即断开 | 缺少 `proxy_http_version 1.1` 或 `Connection ''` | 添加 SSE 专用配置 |
+| 数据延迟数秒才到达 | `proxy_buffering on` 未禁用 | 设置 `proxy_buffering off` |
+| 60秒后自动断开 | 超时配置过短 | 增加 `proxy_read_timeout` 到 24小时 |
+| `net::ERR_FAILED` | Nginx 配置未生效 | 执行 `nginx -t && nginx -s reload` |
+| HTTPS 下无法连接 | 后端使用 HTTP，需要协议转换 | 使用 `proxy_pass http://...` 即可 |
 ```
 
 
@@ -451,8 +652,10 @@ docker exec -it photonix-mariadb mysql -uphotonix -pphotonix123456
 
 ### 日志管理
 - **日志级别**：通过 `LOG_LEVEL` 环境变量控制
-- **日志格式**：结构化 JSON 格式，便于分析
-- **日志轮转**：Docker 日志轮转配置
+- **日志格式**：可选人类可读或 JSON（设置 `LOG_JSON=true` 输出 JSON，便于集中采集与检索）
+- **追踪标识**：日志自动带 `[Trace:<前8位>]` 段，HTTP 响应头包含 `X-Trace-Id`、`X-Span-Id`
+- **前缀规范化**：旧日志前缀会被统一到中文前缀（如 `[Orchestrator]` → `[调度器]`）
+- **日志轮转**：建议使用 Docker 日志驱动或外部日志系统管理
 
 ### 数据备份
 - **数据库备份**：定期备份 MariaDB 数据库（mysqldump）
@@ -617,6 +820,10 @@ docker compose logs -f
 - **视频播放异常**：检查 FFmpeg 依赖、视频格式和 HLS 配置
 - **缩略图不显示**：检查 Sharp 依赖和磁盘权限
 - **缓存不生效**：检查 Redis 连接和内存配置
+- **相册删除提示权限不足**：确认挂载的照片目录对容器运行用户具备写权限。
+  - **普通 Linux 主机**：建议在宿主机执行 `sudo chown -R <容器UID:GID> /opt/photos`（Node 官方镜像通常为 `1000:1000`），或在 `docker-compose.yml` 的 `app` 服务中添加 `user: "1000:1000"`，让容器进程以具备写权限的用户运行。
+  - **NAS/NFS（如 Synology DSM）**：在 DSM 中创建专用的“Photonix”用户/用户组，并赋予共享目录读写权限；随后在容器配置中将 `user` 指向该用户的 UID/GID，或使用 DSM 套件的“用户映射”功能保证容器用户与共享权限一致。为避免 DSM GUI 显示数字 UID，可在 DSM 上同步创建同名账号。
+  - 修改属主不会影响 root 删除/管理能力；若仍提示 403，请确认 NFS 挂载选项允许写入（不要启用 `ro`、`root_squash` 等限制），并重新启动容器。
 
 ### 网络问题
 - **SSE 连接断开**：检查反向代理配置，确保长连接支持

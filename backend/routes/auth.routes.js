@@ -6,8 +6,17 @@ const express = require('express');
 const router = express.Router();
 const authController = require('../controllers/auth.controller');
 const rateLimit = require('express-rate-limit');
-const RedisStore = require('rate-limit-redis');
-const { redis } = require('../config/redis');
+let refreshStore;
+try {
+  const { redis } = require('../config/redis');
+  const useRedis = (process.env.RATE_LIMIT_USE_REDIS || 'false').toLowerCase() === 'true';
+  if (redis && !redis.isNoRedis && useRedis) {
+    const RedisStore = require('rate-limit-redis');
+    refreshStore = new RedisStore({ sendCommand: (...args) => redis.call(...args) });
+  }
+} catch (error) {
+  logger.debug('[Auth] Redis限流存储初始化失败:', error.message);
+}
 const { validate, Joi, asyncHandler } = require('../middleware/validation');
 
 // 定义认证相关的路由端点
@@ -22,7 +31,7 @@ const refreshLimiter = rateLimit({
   max: REFRESH_RATE_MAX,
   standardHeaders: true,
   legacyHeaders: false,
-  store: new RedisStore({ sendCommand: (...args) => redis.call(...args) }),
+  store: refreshStore,
   // 成功刷新不计入配额，避免正常续期触发429
   skipSuccessfulRequests: true,
   handler: (req, res, _next, options) => {
@@ -34,7 +43,9 @@ const refreshLimiter = rateLimit({
         const diff = Math.ceil((ts - Date.now()) / 1000);
         if (diff > 0 && diff < 24 * 3600) retryAfterSeconds = diff;
       }
-    } catch {}
+    } catch (error) {
+      logger.debug('[Auth] 计算retryAfter失败:', error.message);
+    }
     if (typeof retryAfterSeconds === 'number') res.setHeader('Retry-After', String(retryAfterSeconds));
     return res.status(options.statusCode).json({ code: 'TOO_MANY_REQUESTS', message: '尝试过于频繁，请稍后重试', retryAfterSeconds });
   }

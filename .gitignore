@@ -4,7 +4,8 @@ backend/node_modules/
 frontend/node_modules/
 
 # Build artifacts
-frontend/output.css
+frontend/assets/css/output.css
+frontend/sw.js
 frontend/js/dist/
 backend/public/
 
@@ -44,4 +45,8 @@ frontend/.parcel-cache/
 # Docker / Compose (local overrides)
 docker-compose.override.yml
 redis_data/
-.env
+
+# Development documentation (not needed in git)
+frontend/技术债务**.md
+frontend/债务修复**.md
+

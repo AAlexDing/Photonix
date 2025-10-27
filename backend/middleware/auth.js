@@ -3,8 +3,18 @@
  * 处理用户认证和授权，支持密码保护、公开访问控制和JWT令牌验证
  */
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { getAllSettings } = require('../services/settings.service');
 const logger = require('../config/logger');
+const { ENABLE_AUTH_DEBUG_LOGS } = require('../config');
+const { getUserRole } = require('./permissions');
+const state = require('../services/state.manager');
+
+const shouldLogVerbose = () => ENABLE_AUTH_DEBUG_LOGS;
+
+// 认证缓存，避免重复验证相同的token
+const authCache = new Map();
+const AUTH_CACHE_TTL = 30000; // 30秒缓存
 
 /**
  * JWT密钥配置
@@ -84,11 +94,75 @@ module.exports = async function(req, res, next) {
             logger.error(`[${req.requestId || '-'}] [Auth] 服务器缺少 JWT_SECRET 配置，无法验证 Token`);
             return res.status(500).json({ code: 'SERVER_CONFIG_MISSING', message: '服务器缺少 JWT 配置', requestId: req.requestId });
         }
+
+        // 检查认证缓存
+        const cacheKey = crypto.createHash('sha256').update(token).digest('hex');
+        const cachedAuth = authCache.get(cacheKey);
+        const now = Date.now();
+        
+        if (cachedAuth && cachedAuth.token === token && (now - cachedAuth.timestamp) < AUTH_CACHE_TTL) {
+            // 使用缓存的认证结果
+            req.user = cachedAuth.user;
+            req.userRole = cachedAuth.userRole;
+            req.userPermissions = cachedAuth.userPermissions;
+            return next();
+        }
+
+        // 只在开发环境或首次认证时记录详细日志
+        const isFirstAuth = !state.auth.isFirstAuthLogged();
+        if (shouldLogVerbose()) {
+            logger.debug(`[${req.requestId || '-'}] [Auth] 开始验证token，JWT_SECRET前缀: ${JWT_SECRET.substring(0, 8)}...`);
+            logger.debug(`[${req.requestId || '-'}] [Auth] Token前缀: ${token.substring(0, 20)}...`);
+            state.auth.setFirstAuthLogged(true);
+        }
+
         const decoded = jwt.verify(token, JWT_SECRET);
+
+        // 只在允许的环境记录详细解码信息
+        if (shouldLogVerbose()) {
+            logger.debug(`[${req.requestId || '-'}] [Auth] Token验证成功，decoded:`, {
+                sub: decoded?.sub,
+                iat: decoded?.iat,
+                exp: decoded?.exp
+            });
+        }
+
         // 修正：Token 中只包含 `sub` 声明，移除对 `id` 或 `user` 的无效检查
         // 如果 `sub` 不存在，则视为匿名用户，与系统单用户设计保持一致
         const userId = decoded?.sub || 'anonymous';
         req.user = { id: String(userId) };
+
+        // 添加用户角色信息
+        req.userRole = getUserRole(req);
+        req.userPermissions = [];
+
+        // 缓存认证结果
+        authCache.set(cacheKey, {
+            token,
+            user: req.user,
+            userRole: req.userRole,
+            userPermissions: req.userPermissions,
+            timestamp: now
+        });
+
+        // 定期清理过期缓存
+        if (authCache.size > 100) {
+            for (const [key, value] of authCache.entries()) {
+                if (now - value.timestamp > AUTH_CACHE_TTL) {
+                    authCache.delete(key);
+                }
+            }
+        }
+
+        // 只在开发环境或首次认证时记录完成日志
+        if (shouldLogVerbose()) {
+            logger.debug(`[${req.requestId || '-'}] [Auth] 用户认证完成:`, {
+                userId: req.user.id,
+                userRole: req.userRole,
+                requestPath: req.originalUrl
+            });
+        }
+
         next(); // Token 有效，继续处理请求
 
     } catch (err) {
