@@ -19,9 +19,11 @@ exports.searchItems = async (req, res) => {
 
     // 检查索引是否就绪（使用优化的getCount避免全表扫描）
     try {
-        const itemCount = await getCount('items', 'main');
-        const ftsCount = await getCount('items_fts', 'main');
-        if (itemCount === 0 || ftsCount === 0) {
+        const { dbAll } = require('../db/multi-db');
+        const itemCountResult = await dbAll('main', "SELECT COUNT(*) as count FROM items");
+        const itemCount = itemCountResult && itemCountResult[0] ? itemCountResult[0].count : 0;
+        
+        if (itemCount === 0) {
             return res.status(503).json({ code: 'SEARCH_UNAVAILABLE', message: '搜索索引正在构建中，请稍后再试', requestId: req.requestId });
         }
     } catch (error) {

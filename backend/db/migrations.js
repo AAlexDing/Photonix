@@ -9,8 +9,7 @@ const logger = require('../config/logger');
 // 主数据库迁移（图片/视频索引）
 const initializeMainDB = async () => {
     try {
-        logger.info('开始初始化主数据库...');
-        
+        logger.info('[MAIN MIGRATION] 开始主数据库迁移...');
         // 创建 migrations 记录表
         logger.info('创建migrations表...');
         const createMigrationsTableSQL = `CREATE TABLE IF NOT EXISTS migrations (
@@ -116,11 +115,11 @@ const initializeMainDB = async () => {
 // 设置数据库迁移
 const initializeSettingsDB = async () => {
     try {
+        logger.debug('[SETTINGS MIGRATION] 开始设置数据库迁移...');
         await runAsync('settings', `CREATE TABLE IF NOT EXISTS migrations (
             \`key\` VARCHAR(255) PRIMARY KEY, 
             applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
-        
         const settingsMigrations = [
             {
                 key: 'create_settings_table',
@@ -149,6 +148,7 @@ const initializeSettingsDB = async () => {
 // 历史记录数据库迁移
 const initializeHistoryDB = async () => {
     try {
+        logger.debug('[HISTORY MIGRATION] 开始历史记录数据库迁移...');
         await runAsync('history', `CREATE TABLE IF NOT EXISTS migrations (
             \`key\` VARCHAR(255) PRIMARY KEY, 
             applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -179,6 +179,7 @@ const initializeHistoryDB = async () => {
 // 索引数据库迁移
 const initializeIndexDB = async () => {
     try {
+        logger.debug('[INDEX MIGRATION] 开始索引数据库迁移...');
         await runAsync('index', `CREATE TABLE IF NOT EXISTS migrations (
             \`key\` VARCHAR(255) PRIMARY KEY, 
             applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -195,6 +196,10 @@ const initializeIndexDB = async () => {
                     processed_files INT DEFAULT 0, 
                     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+            },
+            {
+                key: 'create_index_progress_table',
+                sql: `CREATE TABLE IF NOT EXISTS index_progress (key TEXT PRIMARY KEY, value TEXT)`
             },
             {
                 key: 'create_index_queue_table',
@@ -219,42 +224,46 @@ const initializeIndexDB = async () => {
 
 // 执行迁移的通用函数
 const executeMigrations = async (dbType, migrations) => {
+    const dbTypeUpper = dbType.toUpperCase();
+    const migrationsToRun = [];
+
+    // 先检查哪些迁移需要执行
     for (const migration of migrations) {
-        try {
-            logger.info(`[${dbType.toUpperCase()} MIGRATION] 开始检查迁移: ${migration.key}`);
-            
-            const done = await dbAll(dbType, "SELECT 1 FROM migrations WHERE `key` = ?", [migration.key]);
-            const needRun = migration.check ? await migration.check() : true;
-            
-            if (!done.length && needRun) {
-                logger.info(`[${dbType.toUpperCase()} MIGRATION] 执行迁移SQL: ${migration.key}`);
-                logger.debug(`[${dbType.toUpperCase()} MIGRATION] SQL: ${migration.sql}`);
-                
-                await runAsync(dbType, migration.sql);
-                await runAsync(dbType, "INSERT INTO migrations (`key`, applied_at) VALUES (?, NOW())", [migration.key]);
-                logger.info(`[${dbType.toUpperCase()} MIGRATION] 完成迁移: ${migration.key}`);
-            } else {
-                logger.debug(`[${dbType.toUpperCase()} MIGRATION] 跳过迁移（已执行或不需要）: ${migration.key}`);
-            }
-        } catch (error) {
-            logger.error(`[${dbType.toUpperCase()} MIGRATION] 迁移失败: ${migration.key}`);
-            logger.error(`[${dbType.toUpperCase()} MIGRATION] 错误信息:`, error.message || error.toString());
-            logger.error(`[${dbType.toUpperCase()} MIGRATION] SQL语句:`, migration.sql);
-            
-            // 创建一个新的错误来确保有意义的错误信息
-            const newError = new Error(`迁移失败: ${migration.key} - ${error.message || error.toString()}`);
-            newError.originalError = error;
-            newError.migrationKey = migration.key;
-            newError.sql = migration.sql;
-            throw newError;
+        const done = await dbAll(dbType, "SELECT 1 FROM migrations WHERE `key` = ?", [migration.key]);
+        const needRun = migration.check ? await migration.check() : true;
+
+        if (!done.length && needRun) {
+            migrationsToRun.push(migration.key);
         }
+    }
+
+    // 如果有迁移需要执行，记录开始信息
+    if (migrationsToRun.length > 0) {
+        logger.debug(`[${dbTypeUpper} MIGRATION] 开始执行 ${migrationsToRun.length} 个迁移步骤: ${migrationsToRun.join(', ')}`);
+
+        // 执行所有需要的迁移
+        for (const migration of migrations) {
+            if (migrationsToRun.includes(migration.key)) {
+                try {
+                    await runAsync(dbType, migration.sql);
+                    await runAsync(dbType, "INSERT INTO migrations (key, applied_at) VALUES (?, ?)", [migration.key, new Date().toISOString()]);
+                } catch (error) {
+                    logger.error(`[${dbTypeUpper} MIGRATION] 迁移失败: ${migration.key} - ${error.message}`);
+                    throw error;
+                }
+            }
+        }
+
+        logger.debug(`[${dbTypeUpper} MIGRATION] 所有迁移步骤执行完成`);
+    } else {
+        logger.debug(`[${dbTypeUpper} MIGRATION] 无需执行新的迁移步骤`);
     }
 };
 
 // 初始化所有数据库
 const initializeAllDBs = async () => {
     try {
-        logger.info('开始初始化所有数据库...');
+        logger.debug('开始初始化所有数据库...');
         // 顺序初始化以避免原生库在高并发下的潜在竞态
         await initializeMainDB();
         await initializeSettingsDB();
