@@ -20,16 +20,16 @@ async function getCount(tableName, dbType = 'main', condition = '', params = [])
         // 优化常用查询的SQL
         if (tableName === 'thumb_status' && !condition) {
             // 针对thumb_status表的优化查询
-            sql = `SELECT COUNT(*) as count FROM thumb_status INDEXED BY idx_thumb_status_count_optimization`;
+            sql = `SELECT COUNT(*) as count FROM thumb_status`;
         } else if (tableName === 'items' && !condition) {
             // 针对items表的优化查询
-            sql = `SELECT COUNT(*) as count FROM items INDEXED BY idx_items_count_optimization`;
+            sql = `SELECT COUNT(*) as count FROM items`;
         } else if (tableName === 'items' && condition.includes("type='video'")) {
             // 针对视频类型查询的优化
-            sql = `SELECT COUNT(*) as count FROM items INDEXED BY idx_items_type_id WHERE type='video'`;
+            sql = `SELECT COUNT(*) as count FROM items WHERE type='video'`;
         } else if (tableName === 'items' && condition.includes("type='photo'")) {
             // 针对图片类型查询的优化
-            sql = `SELECT COUNT(*) as count FROM items INDEXED BY idx_items_type_id WHERE type='photo'`;
+            sql = `SELECT COUNT(*) as count FROM items WHERE type='photo'`;
         } else {
             // 默认查询
             sql = `SELECT COUNT(*) as count FROM ${tableName} ${condition ? 'WHERE ' + condition : ''}`;

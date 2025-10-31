@@ -272,11 +272,11 @@ class ItemsRepository {
             let sql, params;
             if (type) {
                 // 使用类型索引优化COUNT查询
-                sql = 'SELECT COUNT(1) as count FROM items INDEXED BY idx_items_type_id WHERE type = ?';
+                sql = 'SELECT COUNT(1) as count FROM items WHERE type = ?';
                 params = [type];
             } else {
-                // 使用专门的COUNT优化索引
-                sql = 'SELECT COUNT(1) as count FROM items INDEXED BY idx_items_count_optimization';
+                // COUNT查询
+                sql = 'SELECT COUNT(1) as count FROM items';
                 params = [];
             }
             const row = await dbGet('main', sql, params);

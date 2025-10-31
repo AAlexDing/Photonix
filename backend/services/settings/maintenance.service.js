@@ -16,7 +16,7 @@ const { TraceManager } = require('../../utils/trace');
 const { safeRedisDel } = require('../../utils/helpers');
 const { THUMBS_DIR, PHOTOS_DIR } = require('../../config');
 const { runHlsBatch } = require('../video.service');
-const { dbAll, dbRun, dbAllWithCache, dbGetWithCache, runAsync } = require('../../db/multi-db');
+const { dbAll, dbRun, dbGet, runAsync } = require('../../db/multi-db');
 const idxRepo = require('../../repositories/indexStatus.repo');
 const { getMediaStats, getGroupStats, getCount } = require('../../repositories/stats.repo');
 const { sanitizePath, isPathSafe } = require('../../utils/path.utils');
@@ -385,16 +385,12 @@ async function getIndexStatus() {
   try {
     // 获取索引状态行数据
     const row = await idxRepo.getIndexStatusRow();
-    
-    // 获取各类型文件统计（带缓存，使用索引优化）
-    const itemsStats = await dbAllWithCache('main', "SELECT type, COUNT(1) as count FROM items GROUP BY type", [], {
-      useCache: true,
-      ttl: 30,
-      tags: ['items-stats']
-    });
-    
+
+    // 获取各类型文件统计
+    const itemsStats = await dbAll('main', "SELECT type, COUNT(1) as count FROM items GROUP BY type", []);
+
     // MariaDB使用FULLTEXT索引，不需要虚拟表统计
-    
+
     const currentTime = new Date().toISOString();
 
     return {

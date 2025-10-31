@@ -7,7 +7,8 @@
       "Bash(node:*)",
       "Bash(sed:*)",
       "Bash(echo:*)",
-      "Bash(npm run lint)"
+      "Bash(npm run lint)",
+      "Bash(cat:*)"
     ],
     "deny": []
   }

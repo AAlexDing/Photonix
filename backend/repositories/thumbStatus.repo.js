@@ -8,11 +8,11 @@ const { runPreparedBatchWithRetry, writeThumbStatusWithRetry } = require('../db/
 const logger = require('../config/logger');
 
 const UPSERT_SQL = `INSERT INTO thumb_status(path, mtime, status, last_checked)
-                    VALUES(?, ?, ?, strftime('%s','now')*1000)
-                    ON CONFLICT(path) DO UPDATE SET
-                      mtime=excluded.mtime,
-                      status=excluded.status,
-                      last_checked=excluded.last_checked`;
+                    VALUES(?, ?, ?, UNIX_TIMESTAMP(NOW(3))*1000)
+                    ON DUPLICATE KEY UPDATE
+                      mtime=VALUES(mtime),
+                      status=VALUES(status),
+                      last_checked=VALUES(last_checked)`;
 
 class ThumbStatusRepository {
     /**
@@ -95,10 +95,14 @@ class ThumbStatusRepository {
         const opts = {
             manageTransaction: Boolean(options.manageTransaction),
             chunkSize: Math.max(1, Number(options.chunkSize || 400)),
+            batchOptions: {
+                manageTransaction: Boolean(options.manageTransaction),
+                chunkSize: Math.max(1, Number(options.chunkSize || 400)),
+            }
         };
 
         try {
-            await runPreparedBatchWithRetry(runPreparedBatch, 'main', UPSERT_SQL, rows, opts, redis);
+            await runPreparedBatchWithRetry('main', UPSERT_SQL, rows, opts);
             logger.debug(`[ThumbStatusRepo] 批量upsert完成: ${rows.length}条`);
         } catch (error) {
             logger.error(`[ThumbStatusRepo] 批量upsert失败:`, error.message);
@@ -116,11 +120,11 @@ class ThumbStatusRepository {
      */
     async upsertSingle(path, mtime, status, redis = null) {
         try {
-            await writeThumbStatusWithRetry(dbRun, {
-                path: String(path || '').trim(),
-                mtime: Number(mtime) || Date.now(),
+            await writeThumbStatusWithRetry('main', path, {
                 status: String(status || 'pending'),
-            }, redis);
+                mtime: Number(mtime) || Date.now(),
+                last_checked: Date.now()
+            });
         } catch (error) {
             logger.warn(`[ThumbStatusRepo] upsert失败 (path=${path}):`, error.message);
             throw error;
@@ -135,8 +139,8 @@ class ThumbStatusRepository {
      */
     async updateStatus(path, status) {
         try {
-            await dbRun('main', 
-                'UPDATE thumb_status SET status = ?, last_checked = strftime("%s","now")*1000 WHERE path = ?',
+            await dbRun('main',
+                'UPDATE thumb_status SET status = ?, last_checked = UNIX_TIMESTAMP(NOW(3))*1000 WHERE path = ?',
                 [status, path]
             );
             return true;
@@ -220,11 +224,11 @@ class ThumbStatusRepository {
             let sql, params;
             if (status) {
                 // 使用status索引优化COUNT查询
-                sql = 'SELECT COUNT(1) as count FROM thumb_status INDEXED BY idx_thumb_status_status WHERE status = ?';
+                sql = 'SELECT COUNT(1) as count FROM thumb_status WHERE status = ?';
                 params = [status];
             } else {
                 // 使用专门的COUNT优化索引
-                sql = 'SELECT COUNT(1) as count FROM thumb_status INDEXED BY idx_thumb_status_count_optimization';
+                sql = 'SELECT COUNT(1) as count FROM thumb_status';
                 params = [];
             }
             const row = await dbGet('main', sql, params);
@@ -242,7 +246,7 @@ class ThumbStatusRepository {
     async getStatusStats() {
         try {
             // 使用status索引优化GROUP BY查询
-            const rows = await dbAll('main', 'SELECT status, COUNT(1) as count FROM thumb_status INDEXED BY idx_thumb_status_status GROUP BY status');
+            const rows = await dbAll('main', 'SELECT status, COUNT(1) as count FROM thumb_status GROUP BY status');
             const stats = {};
             (rows || []).forEach(row => {
                 stats[row.status] = Number(row.count) || 0;

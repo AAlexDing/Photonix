@@ -926,10 +926,10 @@ async function batchGenerateMissingThumbnails(limit = 1000) {
 
         // 添加更详细的调试信息（仅在有需要补全的文件时）
         if (missingThumbs && missingThumbs.length > 0) {
-            // 查询各状态的总数，用于调试（使用索引优化）
+            // 查询各状态的总数，用于调试
             const statusCounts = await dbAll('main', `
                 SELECT status, COUNT(1) as count
-                FROM thumb_status INDEXED BY idx_thumb_status_status
+                FROM thumb_status
                 WHERE status IN ('missing', 'failed', 'pending', 'processing', 'exists', 'permanent_failed')
                 GROUP BY status
             `);
