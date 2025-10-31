@@ -387,18 +387,13 @@ async function getIndexStatus() {
     const row = await idxRepo.getIndexStatusRow();
     
     // 获取各类型文件统计（带缓存，使用索引优化）
-    const itemsStats = await dbAllWithCache('main', "SELECT type, COUNT(1) as count FROM items INDEXED BY idx_items_type_id GROUP BY type", [], {
+    const itemsStats = await dbAllWithCache('main', "SELECT type, COUNT(1) as count FROM items GROUP BY type", [], {
       useCache: true,
       ttl: 30,
       tags: ['items-stats']
     });
     
-    // 获取全文搜索索引统计（带缓存）
-    const ftsStats = await dbAllWithCache('main', "SELECT COUNT(1) as count FROM items_fts", [], {
-      useCache: true,
-      ttl: 30,
-      tags: ['fts-stats']
-    });
+    // MariaDB使用FULLTEXT索引，不需要虚拟表统计
     
     const currentTime = new Date().toISOString();
 
@@ -407,8 +402,7 @@ async function getIndexStatus() {
       processedFiles: row?.processed_files || 0,
       totalFiles: row?.total_files || 0,
       lastUpdated: currentTime,
-      itemsStats: itemsStats || [],
-      ftsCount: ftsStats?.[0]?.count || 0
+      itemsStats: itemsStats || []
     };
   } catch (error) {
     logger.warn('获取索引状态失败:', error);
@@ -418,7 +412,6 @@ async function getIndexStatus() {
       processedFiles: 0,
       totalFiles: 0,
       itemsStats: [],
-      ftsCount: 0,
       lastUpdated: new Date().toISOString()
     };
   }

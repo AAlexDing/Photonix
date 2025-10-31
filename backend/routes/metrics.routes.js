@@ -120,12 +120,10 @@ router.get('/summary', metricsLimiter, async (req, res) => {
     // 基础表统计（轻量 COUNT/聚合，可通过 ?fast=1 跳过）
     const fast = ['1','true','yes'].includes(String(req.query.fast || '').toLowerCase());
     let itemsCount = 0;
-    let ftsCount = 0;
     let albumCoversCount = 0;
     let thumbStats = [];
     if (!fast) {
       itemsCount = await getCount('items', 'main');
-      ftsCount = await getCount('items_fts', 'main');
       albumCoversCount = await getCount('album_covers', 'main');
       thumbStats = await getGroupStats('thumb_status', 'status');
     }
@@ -190,7 +188,6 @@ router.get('/summary', metricsLimiter, async (req, res) => {
         index,
         db: {
           items: Number(itemsCount || 0),
-          itemsFts: Number(ftsCount || 0),
           albumCovers: Number(albumCoversCount || 0),
           thumbStatus: thumbStats
         },

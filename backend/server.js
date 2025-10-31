@@ -25,16 +25,14 @@ const { normalizeWorkerMessage } = require('./utils/workerMessage');
 const { validateCriticalConfig } = require('./config/validator');
 const { handleUncaughtException, handleUnhandledRejection } = require('./middleware/errorHandler');
 // 延后加载 Redis，避免无 Redis 环境下启动即触发连接
-const { PORT, THUMBS_DIR, DB_FILE, SETTINGS_DB_FILE, HISTORY_DB_FILE, INDEX_DB_FILE, PHOTOS_DIR, DATA_DIR } = require('./config');
+const { PORT, THUMBS_DIR, PHOTOS_DIR, DATA_DIR } = require('./config');
 const { initializeConnections, closeAllConnections } = require('./db/multi-db');
 const { initializeAllDBs, ensureCoreTables } = require('./db/migrations');
-const { migrateToMultiDB } = require('./db/migrate-to-multi-db');
 const { createThumbnailWorkerPool, ensureCoreWorkers, getVideoWorker } = require('./services/worker.manager');
 const { startAdaptiveScheduler } = require('./services/adaptive.service');
 const { setupThumbnailWorkerListeners, startIdleThumbnailGeneration } = require('./services/thumbnail.service');
 const { setupWorkerListeners, buildSearchIndex, watchPhotosDir, ensureWatcherRunning } = require('./services/indexer.service');
 const { setWatcherRestartFunction } = require('./middleware/watcherRestart');
-const { withTimeout, dbAllOnPath } = require('./db/multi-db');
 const { timeUtils, TIME_CONSTANTS } = require('./utils/time.utils');
 const { getCount, getThumbProcessingStats, getDataIntegrityStats } = require('./repositories/stats.repo');
 
@@ -400,56 +398,13 @@ async function initializeDirectories() {
 
 /**
  * 检查/执行数据库迁移逻辑
- * - 判断是否需从旧版 gallery.db 迁移
- * - 多库结构时跳过
+ * 注意：已从SQLite迁移到MariaDB，不再需要SQLite迁移逻辑
  * @async
  */
 async function handleDatabaseMigration() {
     logger.info('正在检查数据库迁移需求...');
-
-    // 检查旧、新数据库文件存在性
-    let oldDbExists = false;
-    try {
-        await fs.access(DB_FILE);
-        oldDbExists = true;
-    } catch (e) {
-        logger.debug('旧数据库文件不存在（正常）:', e && e.message);
-    }
-
-    let newDbExists = false;
-    try {
-        await fs.access(SETTINGS_DB_FILE);
-        newDbExists = true;
-    } catch (e) {
-        logger.debug('新数据库文件不存在（正常）:', e && e.message);
-    }
-
-    let isMigrationNeeded = false;
-
-    // 仅当旧库存在且新库不存在时进一步判断需不需要迁移
-    if (oldDbExists && !newDbExists) {
-        // 旧库存在但新库不存在，需确认旧库非空
-        const tables = await withTimeout(
-            dbAllOnPath(DB_FILE, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"),
-            10000,
-            { sql: "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'" }
-        );
-
-        if (tables.length > 0) {
-            isMigrationNeeded = true;
-        }
-    }
-
-    if (isMigrationNeeded) {
-        logger.info('检测到包含数据的旧版数据库 gallery.db，将执行一次性迁移...');
-        await migrateToMultiDB();
-    } else {
-        if (oldDbExists && !newDbExists) {
-            logger.info('检测到空的或无效的旧版数据库文件 gallery.db，将忽略并进行全新初始化。');
-        } else {
-            logger.info('数据库结构已是多库架构，无需迁移。');
-        }
-    }
+    logger.info('数据库架构为MariaDB多库结构，无需迁移。');
+    // MariaDB迁移逻辑已通过 initializeAllDBs 处理
 }
 
 /**
@@ -768,8 +723,7 @@ async function startServer() {
         setTimeout(async () => {
             try {
                 const itemCount = await getCount('items', 'main');
-                const ftsCount = await getCount('items_fts', 'main');
-                logger.debug(`索引状态检查 - items表: ${itemCount} 条记录, FTS表: ${ftsCount} 条记录`);
+                logger.debug(`索引状态检查 - items表: ${itemCount} 条记录`);
             } catch (error) {
                 logger.debug('索引状态检查失败（降噪）：', error && error.message);
             }

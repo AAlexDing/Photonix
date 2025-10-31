@@ -247,13 +247,21 @@ app.get('/health', async (req, res) => {
             summary.issues.push('items_table');
         }
 
+        // 检查FULLTEXT索引是否存在
         try {
-            await dbAll('main', "SELECT 1 FROM items_fts LIMIT 1");
-            schema.itemsFts = { status: 'ok' };
+            const indexes = await dbAll('main', `
+                SELECT INDEX_NAME 
+                FROM INFORMATION_SCHEMA.STATISTICS 
+                WHERE TABLE_SCHEMA = 'photonix_main' 
+                AND TABLE_NAME = 'items' 
+                AND INDEX_NAME = 'idx_items_name_fulltext'
+            `);
+            schema.fulltextIndex = { status: indexes.length > 0 ? 'ok' : 'missing' };
+            if (indexes.length === 0) {
+                summary.issues.push('fulltext_index_missing');
+            }
         } catch (error) {
-            schema.itemsFts = { status: 'missing', error: error.message };
-            healthy = false;
-            summary.issues.push('items_fts_table');
+            schema.fulltextIndex = { status: 'error', error: error.message };
         }
 
         summary.dependencies.database.schema = schema;

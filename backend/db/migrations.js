@@ -199,7 +199,10 @@ const initializeIndexDB = async () => {
             },
             {
                 key: 'create_index_progress_table',
-                sql: `CREATE TABLE IF NOT EXISTS index_progress (key TEXT PRIMARY KEY, value TEXT)`
+                sql: `CREATE TABLE IF NOT EXISTS index_progress (
+                    \`key\` VARCHAR(255) PRIMARY KEY,
+                    value TEXT
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
             },
             {
                 key: 'create_index_queue_table',
@@ -246,7 +249,7 @@ const executeMigrations = async (dbType, migrations) => {
             if (migrationsToRun.includes(migration.key)) {
                 try {
                     await runAsync(dbType, migration.sql);
-                    await runAsync(dbType, "INSERT INTO migrations (key, applied_at) VALUES (?, ?)", [migration.key, new Date().toISOString()]);
+                    await runAsync(dbType, "INSERT INTO migrations (`key`, applied_at) VALUES (?, NOW())", [migration.key]);
                 } catch (error) {
                     logger.error(`[${dbTypeUpper} MIGRATION] 迁移失败: ${migration.key} - ${error.message}`);
                     throw error;

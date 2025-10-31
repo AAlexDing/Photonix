@@ -43,45 +43,52 @@ async function performSearch(query, page, limit) {
         return { query, results: [], page: 1, totalPages: 1, totalResults: 0, limit };
     }
 
-    let whereCondition = 'items_fts.name MATCH ?';
+    // MariaDB FULLTEXT搜索语法
+    const whereCondition = `MATCH(i.name) AGAINST(? IN BOOLEAN MODE)`;
     const queryParams = [ftsQuery];
     const leafAlbumPredicate = `(
         i.type = 'video'
         OR (
             i.type = 'album'
             AND NOT EXISTS (
-                SELECT 1 FROM items child
+                SELECT 1 FROM items AS child
                 WHERE child.type = 'album'
-                  AND child.path LIKE i.path || '/%'
+                  AND child.path LIKE CONCAT(i.path, '/%')
             )
         )
     )`;
 
-    whereCondition += ` AND ${leafAlbumPredicate}`;
-    const excludePermanentFailed = `NOT EXISTS (SELECT 1 FROM thumb_status ts WHERE ts.path = i.path AND ts.status = 'permanent_failed')`;
-    whereCondition += ` AND ${excludePermanentFailed}`;
+    const fullWhereCondition = `${whereCondition} AND ${leafAlbumPredicate} AND NOT EXISTS (SELECT 1 FROM thumb_status ts WHERE ts.path = i.path AND ts.status = 'permanent_failed')`;
 
     try {
+        // 计算总数 - 使用MariaDB FULLTEXT搜索
         const totalCountSql = `
             SELECT COUNT(1) AS count
-            FROM items_fts
-            JOIN items i ON items_fts.rowid = i.id
-            WHERE ${whereCondition}
+            FROM items i
+            WHERE ${fullWhereCondition}
         `;
         const totalRow = await dbAll('main', totalCountSql, queryParams);
         const totalResults = totalRow?.[0]?.count || 0;
         const totalPages = Math.ceil(Math.max(totalResults, 1) / limit);
 
+        // 获取分页数据 - 使用MariaDB FULLTEXT搜索
         const unifiedSql = `
-            SELECT i.id, i.path, i.type, i.mtime, i.width, i.height, items_fts.rank, i.name
-            FROM items_fts
-            JOIN items i ON items_fts.rowid = i.id
-            WHERE ${whereCondition}
-            ORDER BY CASE i.type WHEN 'album' THEN 0 ELSE 1 END, items_fts.rank ASC
+            SELECT 
+                i.id, 
+                i.path, 
+                i.type, 
+                i.mtime, 
+                i.width, 
+                i.height, 
+                MATCH(i.name) AGAINST(? IN BOOLEAN MODE) as relevance,
+                i.name
+            FROM items i
+            WHERE ${fullWhereCondition}
+            ORDER BY CASE i.type WHEN 'album' THEN 0 ELSE 1 END, relevance DESC
             LIMIT ? OFFSET ?
         `;
 
-        const paginatedParams = [...queryParams, limit, offset];
+        const paginatedParams = [ftsQuery, ...queryParams, limit, offset];
         const paginatedResults = await dbAll('main', unifiedSql, paginatedParams);
 
         const albumResultsForCover = paginatedResults.filter(r => r.type === 'album');

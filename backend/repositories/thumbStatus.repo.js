@@ -4,7 +4,7 @@
  * 职责：封装thumb_status表的所有数据库操作
  */
 const { dbGet, dbAll, dbRun, runPreparedBatch } = require('../db/multi-db');
-const { runPreparedBatchWithRetry, writeThumbStatusWithRetry } = require('../db/sqlite-retry');
+const { runPreparedBatchWithRetry, writeThumbStatusWithRetry } = require('../db/database-retry');
 const logger = require('../config/logger');
 
 const UPSERT_SQL = `INSERT INTO thumb_status(path, mtime, status, last_checked)

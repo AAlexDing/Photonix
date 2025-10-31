@@ -3,7 +3,7 @@
  * - 约定：事务边界统一由 tx.manager 控制，禁止在此处开启事务
  */
 const { runPreparedBatch } = require('../db/multi-db');
-const { runPreparedBatchWithRetry } = require('../db/sqlite-retry');
+const { runPreparedBatchWithRetry } = require('../db/database-retry');
 
 /**
  * 执行批量 SQL
